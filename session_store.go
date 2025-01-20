@@ -22,9 +22,7 @@ func addSession(clientKey string, s *session) {
 	logrus.Infof("Session created for %s. Current session count: %d", clientKey, newCount)
 
 	if oldCount == 0 {
-		// Start the server if needed
 		go startServerIfNotRunning()
-		// Cancel the auto-stop timer
 		cancelAutoStopTimer()
 	}
 }
@@ -37,7 +35,6 @@ func removeSession(clientKey string) {
 	count := len(sessions)
 	logrus.Infof("Session removed for %s. Current session count: %d", clientKey, count)
 
-	// If no sessions left, schedule auto-stop
 	if count == 0 {
 		scheduleAutoStop()
 	}
