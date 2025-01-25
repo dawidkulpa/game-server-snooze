@@ -14,6 +14,7 @@ type session struct {
 	serverConn   *net.UDPConn
 	module       games.GameModule
 	lastActivity time.Time
+	stopMonitor  chan struct{}
 }
 
 // createSession spawns a goroutine to handle server->client traffic
@@ -34,6 +35,7 @@ func createSession(
 		serverConn:   connToServer,
 		module:       module,
 		lastActivity: time.Now(),
+		stopMonitor:  make(chan struct{}),
 	}
 
 	go s.idleMonitor(clientAddr.String())
@@ -87,10 +89,16 @@ func (s *session) idleMonitor(clientKey string) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		if time.Since(s.lastActivity) > globalConfig.IdleTimeout {
-			logrus.Infof("Session %s idle for over %v, removing", clientKey, globalConfig.IdleTimeout)
-			removeSession(clientKey)
+	for {
+		select {
+		case <-ticker.C:
+			if time.Since(s.lastActivity) > globalConfig.IdleTimeout {
+				logrus.Infof("Session %s idle for over %v, removing", clientKey, globalConfig.IdleTimeout)
+				removeSession(clientKey)
+				return
+			}
+		case <-s.stopMonitor:
+			logrus.Infof("Stopping idle monitor for %s", clientKey)
 			return
 		}
 	}
@@ -98,6 +106,10 @@ func (s *session) idleMonitor(clientKey string) {
 
 func delayedSessionRemoval(clientKey string) {
 	time.Sleep(1 * time.Second)
+	sess, ok := getSession(clientKey)
+	if ok {
+		close(sess.stopMonitor)
+	}
 	removeSession(clientKey)
 }
 
