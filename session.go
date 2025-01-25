@@ -48,36 +48,35 @@ func createSession(
 
 		for {
 			n, _, err := connToServer.ReadFromUDP(buf)
-			s.touchActivity()
 			if err != nil {
 				logrus.Errorf("Error reading from server (session %s): %v", clientAddr, err)
 				return
 			}
-
-			updateLargestServerPacketSize(n)
-
-			if module.DetectClose(buf[:n]) {
-				logrus.Infof("[CLOSE DETECTED] from server for client %s at %s\n  Payload(%d): % X",
-					clientAddr.String(),
-					time.Now().Format(time.RFC3339),
-					n,
-					buf[:n],
-				)
-
-				go delayedSessionRemoval(clientAddr.String())
-				// we do NOT return immediately, to let any final packets forward
-			}
-
-			// Forward data back to the client
-			_, werr := proxyConn.WriteToUDP(buf[:n], clientAddr)
-			if werr != nil {
-				logrus.Errorf("Error forwarding to client %s: %v", clientAddr, werr)
-				return
-			}
+			handleServerPacket(s, proxyConn, buf, n)
 		}
 	}()
 
 	return s, nil
+}
+
+func handleServerPacket(s *session, proxyConn *net.UDPConn, data []byte, n int) {
+	s.touchActivity()
+	updateLargestServerPacketSize(n)
+
+	if s.module.DetectClose(data[:n]) {
+		logrus.Infof("[CLOSE DETECTED] from server for client %s at %s\n  Payload(%d): % X",
+			s.clientAddr.String(),
+			time.Now().Format(time.RFC3339),
+			n,
+			data[:n],
+		)
+		go delayedSessionRemoval(s.clientAddr.String())
+	}
+
+	if _, werr := proxyConn.WriteToUDP(data[:n], s.clientAddr); werr != nil {
+		logrus.Errorf("Error forwarding to client %s: %v", s.clientAddr, werr)
+		return
+	}
 }
 
 func (s *session) touchActivity() {
@@ -100,4 +99,39 @@ func (s *session) idleMonitor(clientKey string) {
 func delayedSessionRemoval(clientKey string) {
 	time.Sleep(1 * time.Second)
 	removeSession(clientKey)
+}
+
+func handleClientPacket(
+	proxyConn *net.UDPConn,
+	serverAddr *net.UDPAddr,
+	clientAddr *net.UDPAddr,
+	data []byte,
+	cfg *Config,
+	module games.GameModule,
+) {
+	sess, ok := getSession(clientAddr.String())
+	if ok {
+		sess.touchActivity()
+		if _, werr := sess.serverConn.WriteToUDP(data, serverAddr); werr != nil {
+			logrus.Errorf("Error forwarding data to server: %v", werr)
+		}
+		return
+	}
+	if !module.DetectStart(data) {
+		logrus.Debugf("Ignoring new connection from %s: no start signature found", clientAddr)
+		return
+	}
+	if sessionCount() >= cfg.MaxSessions {
+		logrus.Infof("Max sessions (%d) reached. Refusing new session for %s", cfg.MaxSessions, clientAddr)
+		return
+	}
+	newSess, err := createSession(clientAddr, serverAddr, proxyConn, cfg.MaxPacketSize, module)
+	if err != nil {
+		logrus.Errorf("Failed to create session for %s: %v", clientAddr, err)
+		return
+	}
+	addSession(clientAddr.String(), newSess)
+	if _, werr := newSess.serverConn.WriteToUDP(data, serverAddr); werr != nil {
+		logrus.Errorf("Error forwarding data to server: %v", werr)
+	}
 }
