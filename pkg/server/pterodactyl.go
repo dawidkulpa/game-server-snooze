@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bytes"
@@ -7,20 +7,23 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"dkulpa.eu/game-server-snooze/pkg/config"
 )
 
 type PterodactylController struct {
 	httpClient *http.Client
-	cfg        PterodactylConfig
+	cfg        config.PterodactylConfig
 }
 
-func NewPterodactylController(cfg PterodactylConfig) *PterodactylController {
-	return &PterodactylController{
+func NewPterodactylController() *PterodactylController {
+	pteroController = &PterodactylController{
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		cfg: cfg,
+		cfg: config.GlobalConfig.Pterodactyl,
 	}
+	return pteroController
 }
 
 func (pc *PterodactylController) StartServer() error {

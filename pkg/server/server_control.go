@@ -1,21 +1,19 @@
-package main
+package server
 
 import (
 	"time"
 
+	"dkulpa.eu/game-server-snooze/pkg/config"
 	"github.com/sirupsen/logrus"
 )
 
 var (
 	autoStopTimer   *time.Timer
 	pteroController *PterodactylController
+	sessionCount    int
 )
 
-func setPterodactylController(p *PterodactylController) {
-	pteroController = p
-}
-
-func startServerIfNotRunning() {
+func StartServerIfNotRunning() {
 	if pteroController == nil {
 		return
 	}
@@ -39,7 +37,7 @@ func startServerIfNotRunning() {
 	}
 }
 
-func cancelAutoStopTimer() {
+func CancelAutoStopTimer() {
 	if autoStopTimer != nil {
 		if autoStopTimer.Stop() {
 			logrus.Infof("Auto-stop timer cancelled (we have new session(s) again).")
@@ -48,17 +46,22 @@ func cancelAutoStopTimer() {
 	}
 }
 
-func scheduleAutoStop() {
-	cancelAutoStopTimer()
-	autoStopTimer = time.AfterFunc(globalConfig.AutoStopDelay, func() {
-		if sessionCount() == 0 && pteroController != nil {
-			logrus.Infof("No sessions for %v. Stopping server via Pterodactyl.", globalConfig.AutoStopDelay)
+func ScheduleAutoStop() {
+	CancelAutoStopTimer()
+	delay := config.GlobalConfig.AutoStopDelay
+	autoStopTimer = time.AfterFunc(delay, func() {
+		if sessionCount == 0 && pteroController != nil {
+			logrus.Infof("No sessions for %v. Stopping server via Pterodactyl.", delay)
 			if err := pteroController.StopServer(); err != nil {
 				logrus.Errorf("Error stopping server: %v", err)
 			}
 		} else {
-			logrus.Infof("Auto-stop timer fired, but session count is now %d. Not stopping.", sessionCount())
+			logrus.Infof("Auto-stop timer fired, but session count is now %d. Not stopping.", sessionCount)
 		}
 	})
-	logrus.Infof("All sessions closed. Scheduled auto-stop in %v...", globalConfig.AutoStopDelay)
+	logrus.Infof("All sessions closed. Scheduled auto-stop in %v...", delay)
+}
+
+func SetSessionCount(count int) {
+	sessionCount = count
 }
