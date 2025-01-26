@@ -1,12 +1,18 @@
-package main
+package session
 
 import (
 	"fmt"
 	"net"
 	"time"
 
-	"dkulpa.eu/game-server-snooze/games"
+	"dkulpa.eu/game-server-snooze/pkg/config"
+	"dkulpa.eu/game-server-snooze/pkg/games"
 	"github.com/sirupsen/logrus"
+)
+
+var (
+	largestClientPacketSize int
+	largestServerPacketSize int
 )
 
 type session struct {
@@ -62,15 +68,14 @@ func createSession(
 }
 
 func handleServerPacket(s *session, proxyConn *net.UDPConn, data []byte, n int) {
+	logrus.Debugf("Received %d bytes from server for client %s", n, s.clientAddr.String())
+	// logrus.Debugf("Payload: % X", data)
 	s.touchActivity()
 	updateLargestServerPacketSize(n)
 
 	if s.module.DetectClose(data[:n]) {
-		logrus.Infof("[CLOSE DETECTED] from server for client %s at %s\n  Payload(%d): % X",
+		logrus.Infof("Closing connection for client %s",
 			s.clientAddr.String(),
-			time.Now().Format(time.RFC3339),
-			n,
-			data[:n],
 		)
 		go delayedSessionRemoval(s.clientAddr.String())
 	}
@@ -92,8 +97,8 @@ func (s *session) idleMonitor(clientKey string) {
 	for {
 		select {
 		case <-ticker.C:
-			if time.Since(s.lastActivity) > globalConfig.IdleTimeout {
-				logrus.Infof("Session %s idle for over %v, removing", clientKey, globalConfig.IdleTimeout)
+			if time.Since(s.lastActivity) > config.GlobalConfig.IdleTimeout {
+				logrus.Infof("Session %s idle for over %v, removing", clientKey, config.GlobalConfig.IdleTimeout)
 				removeSession(clientKey)
 				return
 			}
@@ -113,14 +118,15 @@ func delayedSessionRemoval(clientKey string) {
 	removeSession(clientKey)
 }
 
-func handleClientPacket(
+func HandleClientPacket(
 	proxyConn *net.UDPConn,
 	serverAddr *net.UDPAddr,
 	clientAddr *net.UDPAddr,
 	data []byte,
-	cfg *Config,
 	module games.GameModule,
 ) {
+	logrus.Debugf("Received %d bytes from client %s", len(data), clientAddr)
+	// logrus.Debugf("Payload: % X", data)
 	sess, ok := getSession(clientAddr.String())
 	if ok {
 		sess.touchActivity()
@@ -133,11 +139,12 @@ func handleClientPacket(
 		logrus.Debugf("Ignoring new connection from %s: no start signature found", clientAddr)
 		return
 	}
-	if sessionCount() >= cfg.MaxSessions {
-		logrus.Infof("Max sessions (%d) reached. Refusing new session for %s", cfg.MaxSessions, clientAddr)
+	if sessionCount() >= config.GlobalConfig.MaxSessions {
+		logrus.Infof("Max sessions (%d) reached. Refusing new session for %s", config.GlobalConfig.MaxSessions, clientAddr)
 		return
 	}
-	newSess, err := createSession(clientAddr, serverAddr, proxyConn, cfg.MaxPacketSize, module)
+	logrus.Infof("Creating new session for %s", clientAddr)
+	newSess, err := createSession(clientAddr, serverAddr, proxyConn, config.GlobalConfig.MaxPacketSize, module)
 	if err != nil {
 		logrus.Errorf("Failed to create session for %s: %v", clientAddr, err)
 		return
@@ -145,5 +152,19 @@ func handleClientPacket(
 	addSession(clientAddr.String(), newSess)
 	if _, werr := newSess.serverConn.WriteToUDP(data, serverAddr); werr != nil {
 		logrus.Errorf("Error forwarding data to server: %v", werr)
+	}
+}
+
+func UpdateLargestClientPacketSize(n int) {
+	if n > largestClientPacketSize {
+		largestClientPacketSize = n
+		logrus.Debugf("Largest client packet size: %d", largestClientPacketSize)
+	}
+}
+
+func updateLargestServerPacketSize(n int) {
+	if n > largestServerPacketSize {
+		largestServerPacketSize = n
+		logrus.Debugf("Largest server packet size: %d", largestServerPacketSize)
 	}
 }

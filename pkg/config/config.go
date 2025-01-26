@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"fmt"
@@ -9,6 +9,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
+
+var GlobalConfig Config
 
 type Config struct {
 	ListenAddr    string `yaml:"listen_addr"`
@@ -60,11 +62,13 @@ func LoadConfig() (Config, error) {
 			return cfg, fmt.Errorf("could not parse %s: %v", fileName, err)
 		}
 	} else if !os.IsNotExist(err) {
-		logrus.Warnf("Warning: error opening %s: %v", fileName, err)
+		fmt.Printf("Config does not exist %s: %v", fileName, err)
 	}
 
 	applyEnvOverrides(&cfg)
+	setLogLevel(cfg.LogLevel)
 	logrus.Debugf("Final config: %+v", cfg)
+	GlobalConfig = cfg
 	return cfg, nil
 }
 
@@ -123,5 +127,20 @@ func applyEnvOverrides(cfg *Config) {
 		} else {
 			logrus.Warnf("Warning: invalid IDLE_TIMEOUT=%q: %v", val, err)
 		}
+	}
+}
+
+func setLogLevel(logLevel string) {
+	switch logLevel {
+	case "debug":
+		logrus.SetLevel(logrus.DebugLevel)
+	case "warn":
+		logrus.SetLevel(logrus.WarnLevel)
+	case "error":
+		logrus.SetLevel(logrus.ErrorLevel)
+	case "fatal":
+		logrus.SetLevel(logrus.FatalLevel)
+	default:
+		logrus.SetLevel(logrus.InfoLevel)
 	}
 }

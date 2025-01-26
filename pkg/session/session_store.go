@@ -1,8 +1,9 @@
-package main
+package session
 
 import (
 	"sync"
 
+	"dkulpa.eu/game-server-snooze/pkg/server"
 	"github.com/sirupsen/logrus"
 )
 
@@ -20,10 +21,11 @@ func addSession(clientKey string, s *session) {
 	newCount := len(sessions)
 
 	logrus.Infof("Session created for %s. Current session count: %d", clientKey, newCount)
+	server.SetSessionCount(newCount)
 
 	if oldCount == 0 {
-		go startServerIfNotRunning()
-		cancelAutoStopTimer()
+		go server.StartServerIfNotRunning()
+		server.CancelAutoStopTimer()
 	}
 }
 
@@ -34,9 +36,10 @@ func removeSession(clientKey string) {
 	delete(sessions, clientKey)
 	count := len(sessions)
 	logrus.Infof("Session removed for %s. Current session count: %d", clientKey, count)
+	server.SetSessionCount(count)
 
 	if count == 0 {
-		scheduleAutoStop()
+		server.ScheduleAutoStop()
 	}
 }
 

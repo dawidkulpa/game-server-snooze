@@ -3,17 +3,18 @@ package main
 import (
 	"net"
 
-	"dkulpa.eu/game-server-snooze/games"
+	"dkulpa.eu/game-server-snooze/pkg/config"
+	"dkulpa.eu/game-server-snooze/pkg/games"
+	"dkulpa.eu/game-server-snooze/pkg/server"
+	"dkulpa.eu/game-server-snooze/pkg/session"
 	"github.com/sirupsen/logrus"
 )
 
 func main() {
-	cfg, err := LoadConfig()
+	cfg, err := config.LoadConfig()
 	if err != nil {
 		logrus.Fatalf("Error loading config: %v", err)
 	}
-
-	setGlobalConfig(cfg)
 
 	var gameModule games.GameModule
 	switch cfg.Game {
@@ -23,8 +24,7 @@ func main() {
 		logrus.Fatalf("Unsupported game: %s", cfg.Game)
 	}
 
-	ptero := NewPterodactylController(cfg.Pterodactyl)
-	setPterodactylController(ptero)
+	ptero := server.NewPterodactylController()
 
 	status, err := ptero.GetStatus()
 	if err != nil {
@@ -57,14 +57,13 @@ func main() {
 			logrus.Errorf("Error reading from client: %v", err)
 			continue
 		}
-		updateLargestClientPacketSize(n)
+		session.UpdateLargestClientPacketSize(n)
 
-		handleClientPacket(
+		session.HandleClientPacket(
 			proxyConn,
 			serverAddr,
 			clientAddr,
 			buf[:n],
-			&cfg,
 			gameModule,
 		)
 	}
