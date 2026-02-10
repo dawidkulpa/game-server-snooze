@@ -1,5 +1,5 @@
 # First stage: build
-FROM golang:1.23-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 # environment variables for a static build (for minimal deps):
 ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
