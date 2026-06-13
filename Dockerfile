@@ -14,7 +14,7 @@ RUN go build -o /app ./cmd/main.go
 
 
 # Second stage: minimal runtime
-FROM alpine:3.21
+FROM alpine:3.24
 
 COPY --from=builder /app /usr/local/bin/game-server-snooze
 
