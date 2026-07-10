@@ -110,7 +110,7 @@ The normal suite uses fake Pterodactyl HTTP servers and real localhost UDP socke
 
 Pull requests run formatting, module verification, vet, race tests, a production build, and an AMD64 container health smoke test. No registry credentials are exposed to pull requests.
 
-A protected SemVer Git tag such as `v0.5.0-rc.1` or `v0.5.0` runs the release workflow and publishes a multi-architecture Docker Hub manifest with SBOM and provenance. The repository must provide:
+Publishing a GitHub release for a protected SemVer tag such as `0.5.0-rc.1` or `0.5.0` runs the release workflow and publishes a multi-architecture Docker Hub manifest with SBOM and provenance. Release tags do not use a leading `v` prefix. The repository must provide:
 
 - `DOCKER_USERNAME`
 - `DOCKER_PASSWORD` — a Docker Hub access token with read/write access (the existing secret name is retained)
