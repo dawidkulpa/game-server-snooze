@@ -1,0 +1,605 @@
+package proxy
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"sync"
+	"time"
+
+	"dkulpa.eu/game-server-snooze/pkg/server"
+	"dkulpa.eu/game-server-snooze/pkg/session"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
+)
+
+type WakeDetector interface {
+	DetectStart([]byte) bool
+}
+
+type BackendReadiness interface {
+	WaitReady(context.Context) error
+}
+
+type Options struct {
+	Listener           *net.UDPConn
+	BackendAddr        *net.UDPAddr
+	Controller         server.Controller
+	Detector           WakeDetector
+	Readiness          BackendReadiness
+	MaxSessions        int
+	MaxPacketSize      int
+	IdleTimeout        time.Duration
+	SweepInterval      time.Duration
+	AutoStopDelay      time.Duration
+	AutoStopRetryDelay time.Duration
+
+	StartupTimeout               time.Duration
+	StartupPollInterval          time.Duration
+	StartupSettleDelay           time.Duration
+	StartupFailureCooldown       time.Duration
+	StartupBufferPackets         int
+	StartupBufferBytesPerSession int
+	StartupBufferBytesGlobal     int
+}
+
+const (
+	maxAutoStopAttempts           = 3
+	defaultAutoStopRetryDelay     = 5 * time.Second
+	defaultStartupFailureCooldown = 5 * time.Second
+)
+
+type packetQueue struct {
+	packets        [][]byte
+	bytes          int
+	overflowLogged bool
+}
+
+type Proxy struct {
+	options Options
+	store   *session.Store
+	ready   chan struct{}
+
+	ctx context.Context
+
+	mu                  sync.Mutex
+	admissionMu         sync.Mutex
+	backendReady        bool
+	backendRunning      bool
+	startupRunning      bool
+	startupGeneration   uint64
+	startupBlockedUntil time.Time
+	shuttingDown        bool
+	queues              map[*session.Session]*packetQueue
+	queuedBytes         int
+	stopTimer           *time.Timer
+	stopGeneration      uint64
+	lastCapacityWarning time.Time
+
+	wg      sync.WaitGroup
+	timerWG sync.WaitGroup
+}
+
+func New(options Options) (*Proxy, error) {
+	if options.Listener == nil || options.BackendAddr == nil || options.Controller == nil || options.Detector == nil {
+		return nil, fmt.Errorf("listener, backend, controller, and detector are required")
+	}
+	if options.SweepInterval <= 0 {
+		options.SweepInterval = options.IdleTimeout / 2
+		if options.SweepInterval <= 0 {
+			options.SweepInterval = time.Nanosecond
+		}
+		if options.SweepInterval > 5*time.Second {
+			options.SweepInterval = 5 * time.Second
+		}
+	}
+	if options.AutoStopRetryDelay == 0 {
+		options.AutoStopRetryDelay = defaultAutoStopRetryDelay
+	}
+	if options.StartupFailureCooldown == 0 {
+		options.StartupFailureCooldown = defaultStartupFailureCooldown
+	}
+	if options.MaxPacketSize < 1 || options.IdleTimeout <= 0 || options.AutoStopDelay <= 0 || options.AutoStopRetryDelay < 0 || options.StartupFailureCooldown < 0 {
+		return nil, fmt.Errorf("packet and lifecycle limits must be positive")
+	}
+	if options.StartupTimeout <= 0 || options.StartupPollInterval <= 0 || options.StartupPollInterval >= options.StartupTimeout || options.StartupSettleDelay < 0 {
+		return nil, fmt.Errorf("invalid startup timing")
+	}
+	if options.StartupBufferPackets < 1 || options.StartupBufferBytesPerSession < options.MaxPacketSize || options.StartupBufferBytesGlobal < options.StartupBufferBytesPerSession {
+		return nil, fmt.Errorf("startup buffers must hold at least one maximum-size packet per session")
+	}
+	store, err := session.NewStore(options.MaxSessions)
+	if err != nil {
+		return nil, err
+	}
+	return &Proxy{
+		options: options,
+		store:   store,
+		ready:   make(chan struct{}),
+		queues:  make(map[*session.Session]*packetQueue),
+	}, nil
+}
+
+func (proxy *Proxy) Ready() <-chan struct{} {
+	return proxy.ready
+}
+
+func (proxy *Proxy) Serve(ctx context.Context) error {
+	serveCtx, cancel := context.WithCancel(ctx)
+	proxy.ctx = serveCtx
+	defer func() {
+		cancel()
+		proxy.shutdown()
+		proxy.timerWG.Wait()
+		proxy.wg.Wait()
+	}()
+	close(proxy.ready)
+	state, err := proxy.options.Controller.Status(serveCtx)
+	if err != nil {
+		logrus.WithError(err).Warn("Could not determine initial Pterodactyl state; keeping wake gate closed")
+	} else if state == server.StateRunning {
+		proxy.mu.Lock()
+		proxy.backendRunning = true
+		proxy.backendReady = proxy.options.Readiness == nil
+		proxy.mu.Unlock()
+		if proxy.options.Readiness != nil {
+			proxy.startServer()
+		}
+	}
+
+	proxy.wg.Add(2)
+	go proxy.runSweeper(serveCtx)
+	go func() {
+		defer proxy.wg.Done()
+		<-serveCtx.Done()
+		_ = proxy.options.Listener.Close()
+	}()
+
+	buffer := make([]byte, proxy.options.MaxPacketSize)
+	for {
+		n, _, flags, clientAddr, readErr := proxy.options.Listener.ReadMsgUDP(buffer, nil)
+		if readErr != nil {
+			if serveCtx.Err() != nil || errors.Is(readErr, net.ErrClosed) {
+				break
+			}
+			return fmt.Errorf("read public UDP packet: %w", readErr)
+		}
+		if flags&unix.MSG_TRUNC != 0 {
+			continue
+		}
+		packet := append([]byte(nil), buffer[:n]...)
+		proxy.handleClientPacket(clientAddr, packet)
+	}
+
+	return ctx.Err()
+}
+
+func (proxy *Proxy) handleClientPacket(clientAddr *net.UDPAddr, packet []byte) {
+	if len(packet) == 0 {
+		return
+	}
+	key := clientAddr.String()
+	if existing, ok := proxy.store.Get(key); ok {
+		if proxy.forwardOrQueue(existing, packet) {
+			return
+		}
+	}
+
+	proxy.admissionMu.Lock()
+	defer proxy.admissionMu.Unlock()
+	if existing, ok := proxy.store.Get(key); ok {
+		if proxy.forwardOrQueue(existing, packet) {
+			return
+		}
+		_, _, _ = proxy.store.Remove(key, existing)
+		proxy.removeQueue(existing)
+	}
+
+	proxy.mu.Lock()
+	ready := proxy.backendReady
+	running := proxy.backendRunning
+	startupBlocked := time.Now().Before(proxy.startupBlockedUntil)
+	proxy.mu.Unlock()
+	if startupBlocked {
+		return
+	}
+	if !ready && !running && !proxy.options.Detector.DetectStart(packet) {
+		return
+	}
+
+	createdSession, created, _, err := proxy.store.GetOrCreate(key, func() (*session.Session, error) {
+		return session.NewSession(proxy.ctx, session.SessionOptions{
+			ClientAddr:    clientAddr,
+			BackendAddr:   proxy.options.BackendAddr,
+			PublicConn:    proxy.options.Listener,
+			MaxPacketSize: proxy.options.MaxPacketSize,
+		})
+	})
+	if err != nil {
+		if errors.Is(err, session.ErrSessionCapacity) {
+			if proxy.shouldLogCapacityWarning(time.Now()) {
+				logrus.WithField("max_sessions", proxy.options.MaxSessions).Warn("UDP session capacity reached; dropping new client packet")
+			}
+		} else {
+			logrus.WithError(err).Warn("Could not create UDP session")
+		}
+		return
+	}
+	if created {
+		proxy.cancelAutoStop()
+		proxy.watchSession(key, createdSession)
+	}
+	proxy.forwardOrQueue(createdSession, packet)
+	if !ready {
+		proxy.startServer()
+	}
+}
+
+func (proxy *Proxy) shouldLogCapacityWarning(now time.Time) bool {
+	proxy.mu.Lock()
+	defer proxy.mu.Unlock()
+	if !proxy.lastCapacityWarning.IsZero() && now.Sub(proxy.lastCapacityWarning) < time.Second {
+		return false
+	}
+	proxy.lastCapacityWarning = now
+	return true
+}
+
+func (proxy *Proxy) watchSession(key string, active *session.Session) {
+	proxy.wg.Add(1)
+	go func() {
+		defer proxy.wg.Done()
+		<-active.Done()
+		removed, count, err := proxy.store.Remove(key, active)
+		if err != nil {
+			logrus.WithError(err).Warn("Could not remove closed UDP session")
+		}
+		proxy.removeQueue(active)
+		if removed && count == 0 && proxy.ctx.Err() == nil {
+			proxy.scheduleAutoStop()
+		}
+	}()
+}
+
+func (proxy *Proxy) removeQueue(active *session.Session) {
+	proxy.mu.Lock()
+	if queue, ok := proxy.queues[active]; ok {
+		delete(proxy.queues, active)
+		proxy.queuedBytes -= queue.bytes
+	}
+	proxy.mu.Unlock()
+}
+
+func (proxy *Proxy) forwardOrQueue(active *session.Session, packet []byte) bool {
+	proxy.mu.Lock()
+	if !proxy.backendReady {
+		if err := active.RecordActivity(); err != nil {
+			proxy.mu.Unlock()
+			return false
+		}
+		proxy.enqueueLocked(active, packet)
+		proxy.mu.Unlock()
+		proxy.startServer()
+		return true
+	}
+	proxy.mu.Unlock()
+	if err := active.ForwardClient(packet); err != nil {
+		if !errors.Is(err, session.ErrSessionClosed) {
+			logrus.WithError(err).Warn("Could not forward client UDP packet")
+		}
+		return false
+	}
+	return true
+}
+
+func (proxy *Proxy) enqueueLocked(active *session.Session, packet []byte) {
+	queue := proxy.queues[active]
+	if queue == nil {
+		queue = &packetQueue{}
+		proxy.queues[active] = queue
+	}
+	if len(queue.packets) >= proxy.options.StartupBufferPackets || queue.bytes+len(packet) > proxy.options.StartupBufferBytesPerSession || proxy.queuedBytes+len(packet) > proxy.options.StartupBufferBytesGlobal {
+		if !queue.overflowLogged {
+			queue.overflowLogged = true
+			logrus.Warn("Dropping startup packets because the bounded startup queue is full")
+		}
+		return
+	}
+	copyOfPacket := append([]byte(nil), packet...)
+	queue.packets = append(queue.packets, copyOfPacket)
+	queue.bytes += len(copyOfPacket)
+	proxy.queuedBytes += len(copyOfPacket)
+}
+
+func (proxy *Proxy) startServer() {
+	proxy.mu.Lock()
+	if proxy.shuttingDown || proxy.backendReady || proxy.startupRunning || time.Now().Before(proxy.startupBlockedUntil) {
+		proxy.mu.Unlock()
+		return
+	}
+	proxy.startupRunning = true
+	proxy.startupGeneration++
+	generation := proxy.startupGeneration
+	proxy.mu.Unlock()
+
+	proxy.wg.Add(1)
+	go func() {
+		defer proxy.wg.Done()
+		if err := proxy.ensureRunning(); err != nil && proxy.ctx.Err() == nil {
+			proxy.failStartup(generation, server.IsPermanent(err))
+			logrus.WithError(err).Error("Palworld startup gate failed")
+			return
+		}
+		proxy.finishStartup(generation)
+	}()
+}
+
+func (proxy *Proxy) finishStartup(generation uint64) {
+	proxy.mu.Lock()
+	if proxy.startupGeneration == generation {
+		proxy.startupRunning = false
+	}
+	proxy.mu.Unlock()
+}
+
+func (proxy *Proxy) failStartup(generation uint64, permanent bool) {
+	proxy.admissionMu.Lock()
+	defer proxy.admissionMu.Unlock()
+	proxy.mu.Lock()
+	proxy.queues = make(map[*session.Session]*packetQueue)
+	proxy.queuedBytes = 0
+	if proxy.startupGeneration == generation {
+		proxy.startupRunning = false
+		if permanent {
+			proxy.startupBlockedUntil = time.Now().Add(proxy.options.StartupFailureCooldown)
+		}
+	}
+	proxy.mu.Unlock()
+	if err := proxy.store.CloseAll(); err != nil {
+		logrus.WithError(err).Warn("Could not close every pending UDP session after startup failure")
+	}
+}
+
+func (proxy *Proxy) ensureRunning() error {
+	ctx, cancel := context.WithTimeout(proxy.ctx, proxy.options.StartupTimeout)
+	defer cancel()
+	startSent := false
+	ticker := time.NewTicker(proxy.options.StartupPollInterval)
+	defer ticker.Stop()
+
+	for {
+		state, err := proxy.options.Controller.Status(ctx)
+		if err == nil {
+			switch state {
+			case server.StateRunning:
+				proxy.mu.Lock()
+				proxy.backendRunning = true
+				proxy.mu.Unlock()
+				if proxy.options.Readiness != nil {
+					if err := proxy.options.Readiness.WaitReady(ctx); err != nil {
+						return fmt.Errorf("wait for Palworld application readiness: %w", err)
+					}
+				}
+				if proxy.options.StartupSettleDelay > 0 {
+					timer := time.NewTimer(proxy.options.StartupSettleDelay)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return ctx.Err()
+					case <-timer.C:
+					}
+				}
+				proxy.openStartupGate()
+				return nil
+			case server.StateOffline:
+				proxy.markBackendNotRunning()
+				if !startSent {
+					startErr := proxy.options.Controller.Start(ctx)
+					if startErr != nil && server.IsPermanent(startErr) {
+						return fmt.Errorf("start Pterodactyl server: %w", startErr)
+					}
+					// A retryable transport/5xx response is ambiguous: the panel may
+					// have accepted the request. Never send a duplicate start; keep
+					// polling status within the startup deadline.
+					startSent = true
+				}
+			case server.StateStarting:
+				proxy.markBackendNotRunning()
+				startSent = true
+			case server.StateStopping:
+				proxy.markBackendNotRunning()
+				startSent = false
+			}
+		} else if server.IsPermanent(err) {
+			return fmt.Errorf("query Pterodactyl status: %w", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for Pterodactyl running: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (proxy *Proxy) markBackendNotRunning() {
+	proxy.mu.Lock()
+	proxy.backendRunning = false
+	proxy.backendReady = false
+	proxy.mu.Unlock()
+}
+
+func (proxy *Proxy) openStartupGate() {
+	proxy.mu.Lock()
+	if proxy.shuttingDown {
+		proxy.mu.Unlock()
+		return
+	}
+	proxy.backendRunning = true
+	// Keep ingress gated while flushing so a newly arrived datagram cannot
+	// overtake an older buffered handshake datagram for the same session.
+	for active, queue := range proxy.queues {
+		for _, packet := range queue.packets {
+			if err := active.ForwardClient(packet); err != nil {
+				break
+			}
+		}
+	}
+	proxy.queues = make(map[*session.Session]*packetQueue)
+	proxy.queuedBytes = 0
+	proxy.backendReady = true
+	proxy.mu.Unlock()
+
+	if proxy.store.Len() == 0 {
+		proxy.scheduleAutoStop()
+	}
+}
+
+func (proxy *Proxy) refreshPendingSessions() {
+	proxy.mu.Lock()
+	pending := make([]*session.Session, 0, len(proxy.queues))
+	for active := range proxy.queues {
+		pending = append(pending, active)
+	}
+	proxy.mu.Unlock()
+	for _, active := range pending {
+		_ = active.RecordActivity()
+	}
+}
+
+func (proxy *Proxy) runSweeper(ctx context.Context) {
+	defer proxy.wg.Done()
+	ticker := time.NewTicker(proxy.options.SweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			proxy.refreshPendingSessions()
+			expired, count, err := proxy.store.ExpireIdle(now.Add(-proxy.options.IdleTimeout))
+			if err != nil {
+				logrus.WithError(err).Warn("Could not close every idle session")
+			}
+			if expired > 0 {
+				proxy.removeClosedQueues()
+			}
+			if expired > 0 && count == 0 {
+				proxy.scheduleAutoStop()
+			}
+		}
+	}
+}
+
+func (proxy *Proxy) removeClosedQueues() {
+	proxy.mu.Lock()
+	defer proxy.mu.Unlock()
+	for active, queue := range proxy.queues {
+		select {
+		case <-active.Done():
+			delete(proxy.queues, active)
+			proxy.queuedBytes -= queue.bytes
+		default:
+		}
+	}
+}
+
+func (proxy *Proxy) cancelAutoStop() {
+	proxy.mu.Lock()
+	defer proxy.mu.Unlock()
+	proxy.stopGeneration++
+	proxy.stopAutoStopTimerLocked()
+}
+
+func (proxy *Proxy) scheduleAutoStop() {
+	proxy.mu.Lock()
+	if proxy.shuttingDown || !proxy.backendReady {
+		proxy.mu.Unlock()
+		return
+	}
+	proxy.stopGeneration++
+	generation := proxy.stopGeneration
+	proxy.stopAutoStopTimerLocked()
+	proxy.scheduleAutoStopAttemptLocked(generation, 1, proxy.options.AutoStopDelay)
+	proxy.mu.Unlock()
+}
+
+func (proxy *Proxy) stopAutoStopTimerLocked() {
+	if proxy.stopTimer == nil {
+		return
+	}
+	if proxy.stopTimer.Stop() {
+		proxy.timerWG.Done()
+	}
+	proxy.stopTimer = nil
+}
+
+func (proxy *Proxy) scheduleAutoStopAttemptLocked(generation uint64, attempt int, delay time.Duration) {
+	proxy.timerWG.Add(1)
+	proxy.stopTimer = time.AfterFunc(delay, func() {
+		defer proxy.timerWG.Done()
+		proxy.runAutoStopAttempt(generation, attempt)
+	})
+}
+
+func (proxy *Proxy) runAutoStopAttempt(generation uint64, attempt int) {
+	proxy.admissionMu.Lock()
+	defer proxy.admissionMu.Unlock()
+	if proxy.store.Len() != 0 {
+		return
+	}
+	proxy.mu.Lock()
+	if generation != proxy.stopGeneration || !proxy.backendReady {
+		proxy.mu.Unlock()
+		return
+	}
+	proxy.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err := proxy.options.Controller.Stop(ctx)
+	cancel()
+	if err == nil {
+		proxy.markBackendNotRunning()
+		proxy.mu.Lock()
+		if generation == proxy.stopGeneration {
+			proxy.stopTimer = nil
+		}
+		proxy.mu.Unlock()
+		return
+	}
+
+	if attempt >= maxAutoStopAttempts {
+		logrus.WithError(err).Errorf("Could not auto-stop Palworld after %d attempts", attempt)
+		proxy.mu.Lock()
+		if generation == proxy.stopGeneration {
+			proxy.stopTimer = nil
+		}
+		proxy.mu.Unlock()
+		return
+	}
+	logrus.WithError(err).Warnf("Could not auto-stop Palworld on attempt %d/%d; retrying", attempt, maxAutoStopAttempts)
+	proxy.mu.Lock()
+	if generation == proxy.stopGeneration && proxy.backendReady {
+		delay := proxy.options.AutoStopRetryDelay * time.Duration(1<<(attempt-1))
+		proxy.scheduleAutoStopAttemptLocked(generation, attempt+1, delay)
+	}
+	proxy.mu.Unlock()
+}
+
+func (proxy *Proxy) shutdown() {
+	proxy.admissionMu.Lock()
+	defer proxy.admissionMu.Unlock()
+	proxy.mu.Lock()
+	proxy.shuttingDown = true
+	proxy.backendReady = false
+	proxy.backendRunning = false
+	proxy.startupRunning = false
+	proxy.startupGeneration++
+	proxy.stopGeneration++
+	proxy.stopAutoStopTimerLocked()
+	proxy.mu.Unlock()
+	if err := proxy.store.CloseAll(); err != nil {
+		logrus.WithError(err).Warn("Could not close every UDP session")
+	}
+}

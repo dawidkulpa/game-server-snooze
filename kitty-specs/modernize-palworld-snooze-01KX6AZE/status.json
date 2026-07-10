@@ -1,0 +1,70 @@
+{
+  "event_count": 9,
+  "last_event_id": "01KX6CQCX8S1Z4YEXV7GDWRMH5",
+  "materialized_at": "2026-07-10T16:10:46.056428+00:00",
+  "mission_number": "",
+  "mission_slug": "modernize-palworld-snooze-01KX6AZE",
+  "mission_type": "software-dev",
+  "summary": {
+    "approved": 0,
+    "blocked": 0,
+    "canceled": 0,
+    "claimed": 0,
+    "done": 0,
+    "for_review": 0,
+    "in_progress": 1,
+    "in_review": 0,
+    "planned": 6
+  },
+  "work_packages": {
+    "WP01": {
+      "actor": "user",
+      "force_count": 0,
+      "lane": "in_progress",
+      "last_event_id": "01KX6CQCX8S1Z4YEXV7GDWRMH5",
+      "last_transition_at": "2026-07-10T16:10:46.056428+00:00"
+    },
+    "WP02": {
+      "actor": "finalize-tasks",
+      "force_count": 0,
+      "lane": "planned",
+      "last_event_id": "01KX6BSS34HV7HD7E68WG048B1",
+      "last_transition_at": "2026-07-10T15:54:35.492116+00:00"
+    },
+    "WP03": {
+      "actor": "finalize-tasks",
+      "force_count": 0,
+      "lane": "planned",
+      "last_event_id": "01KX6BSS7T3ANQAQJDK1846RY8",
+      "last_transition_at": "2026-07-10T15:54:35.642603+00:00"
+    },
+    "WP04": {
+      "actor": "finalize-tasks",
+      "force_count": 0,
+      "lane": "planned",
+      "last_event_id": "01KX6BSSCAP1C8Z77Z6BXVSGSM",
+      "last_transition_at": "2026-07-10T15:54:35.786966+00:00"
+    },
+    "WP05": {
+      "actor": "finalize-tasks",
+      "force_count": 0,
+      "lane": "planned",
+      "last_event_id": "01KX6BSSGVJ6JY56ZHC05DJ2FK",
+      "last_transition_at": "2026-07-10T15:54:35.931738+00:00"
+    },
+    "WP06": {
+      "actor": "finalize-tasks",
+      "force_count": 0,
+      "lane": "planned",
+      "last_event_id": "01KX6BSSP2H3V5ARZCFFD5XQ4V",
+      "last_transition_at": "2026-07-10T15:54:36.098455+00:00"
+    },
+    "WP07": {
+      "actor": "finalize-tasks",
+      "force_count": 0,
+      "lane": "planned",
+      "last_event_id": "01KX6BSSVGGNEM4BGX07SJZMQS",
+      "last_transition_at": "2026-07-10T15:54:36.272473+00:00"
+    }
+  }
+}

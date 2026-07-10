@@ -1,0 +1,9 @@
+.git
+.github
+.agents
+.hermes
+.kitty
+kitty-specs
+*.md
+config.yaml
+docker-compose.yml

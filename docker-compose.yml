@@ -1,15 +1,23 @@
 services:
   game-server-snooze-palworld:
-    image: buggy121/game-server-snooze:latest
-    container_name: game-server-snooze-palworld
+    image: buggy121/game-server-snooze:${IMAGE_TAG:-0.5.0}
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "8211:8211/udp"
     environment:
-      LISTEN_ADDR: ":8212"
-      SERVER_ADDR: "127.0.0.1:8211"
+      LISTEN_ADDR: ":8211"
+      SERVER_ADDR: "192.0.2.10:8211"
+      BACKEND_READINESS_ADDR: "192.0.2.10:27015"
       MAX_SESSIONS: "32"
+      MAX_PACKET_SIZE: "65507"
       GAME: "palworld"
+      IDLE_TIMEOUT: "30s"
       AUTO_STOP_DELAY: "1m"
-      PTERO_BASE_URL: "https://your.ptero.panel.url"
-      PTERO_API_TOKEN: "your-api-token"
-      PTERO_SERVER_ID: "your-server-id"
+      PTERO_BASE_URL: "https://panel.example.com"
+      PTERO_API_TOKEN: "${PTERO_API_TOKEN:?set PTERO_API_TOKEN}"
+      PTERO_SERVER_ID: "${PTERO_SERVER_ID:?set PTERO_SERVER_ID}"

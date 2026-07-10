@@ -1,13 +1,35 @@
 listen_addr: ":8211"
-server_addr: ""
+server_addr: "192.0.2.10:8211"
 max_sessions: 32
-max_packet_size: 4096
+max_packet_size: 65507
 game: "palworld"
-auto_stop_delay: 1m
-log_level: "info"
+
 idle_timeout: 30s
+auto_stop_delay: 1m
+startup_timeout: 5m
+startup_poll_interval: 2s
+startup_settle_delay: 5s
+startup_buffer_packets: 32
+startup_buffer_bytes_per_session: 262144
+startup_buffer_bytes_global: 4194304
+
+# A2S verifies Palworld application readiness without REST or RCON.
+backend_readiness_mode: "a2s"
+# Empty derives the gameplay backend host with the default query port 27015.
+backend_readiness_addr: "192.0.2.10:27015"
+
+# Keep signature mode in production. Add current-client hexadecimal prefixes
+# after an attended compatibility test.
+wake_policy: "signature"
+wake_signatures:
+  - "09080004bc597e73"
+log_unmatched_prefixes: false
+diagnostic_prefix_bytes: 8
+
+health_addr: "127.0.0.1:8080"
+log_level: "info"
 
 pterodactyl:
-  base_url: ""
+  base_url: "https://panel.example.com"
   api_token: ""
-  server_id: ""
+  server_id: "example-server-id"
