@@ -1,170 +1,175 @@
 package session
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"dkulpa.eu/game-server-snooze/pkg/config"
-	"dkulpa.eu/game-server-snooze/pkg/games"
-	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
-var (
-	largestClientPacketSize int
-	largestServerPacketSize int
-)
+var ErrSessionClosed = errors.New("session closed")
 
-type session struct {
-	clientAddr   *net.UDPAddr
-	serverConn   *net.UDPConn
-	module       games.GameModule
-	lastActivity time.Time
-	stopMonitor  chan struct{}
+type SessionOptions struct {
+	ClientAddr    *net.UDPAddr
+	BackendAddr   *net.UDPAddr
+	PublicConn    *net.UDPConn
+	MaxPacketSize int
+	clock         func() time.Time
 }
 
-// createSession spawns a goroutine to handle server->client traffic
-func createSession(
-	clientAddr, serverAddr *net.UDPAddr,
-	proxyConn *net.UDPConn,
-	maxPacketSize int,
-	module games.GameModule,
-) (*session, error) {
+type Session struct {
+	clientAddr *net.UDPAddr
+	publicConn *net.UDPConn
+	upstream   *net.UDPConn
+	maxPacket  int
+	clock      func() time.Time
 
-	connToServer, err := net.ListenUDP("udp", nil)
+	lastActivity atomic.Int64
+	closed       atomic.Bool
+	activityMu   sync.Mutex
+	closeOnce    sync.Once
+	goroutineWG  sync.WaitGroup
+	cancel       context.CancelFunc
+	done         chan struct{}
+}
+
+func NewSession(parent context.Context, options SessionOptions) (*Session, error) {
+	if options.ClientAddr == nil || options.BackendAddr == nil || options.PublicConn == nil {
+		return nil, fmt.Errorf("client, backend, and public UDP addresses are required")
+	}
+	if options.MaxPacketSize < 1 {
+		return nil, fmt.Errorf("max packet size must be positive")
+	}
+	if options.clock == nil {
+		options.clock = time.Now
+	}
+
+	upstream, err := net.DialUDP("udp", nil, options.BackendAddr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to listen UDP for server: %v", err)
+		return nil, fmt.Errorf("connect backend UDP socket: %w", err)
 	}
-
-	s := &session{
-		clientAddr:   clientAddr,
-		serverConn:   connToServer,
-		module:       module,
-		lastActivity: time.Now(),
-		stopMonitor:  make(chan struct{}),
+	ctx, cancel := context.WithCancel(parent)
+	s := &Session{
+		clientAddr: options.ClientAddr,
+		publicConn: options.PublicConn,
+		upstream:   upstream,
+		maxPacket:  options.MaxPacketSize,
+		clock:      options.clock,
+		cancel:     cancel,
+		done:       make(chan struct{}),
 	}
-
-	go s.idleMonitor(clientAddr.String())
-
-	go func() {
-		defer func() {
-			connToServer.Close()
-			logrus.Infof("Server->client loop ended for %s", clientAddr)
-		}()
-
-		buf := make([]byte, maxPacketSize)
-
-		for {
-			n, _, err := connToServer.ReadFromUDP(buf)
-			if err != nil {
-				logrus.Errorf("Error reading from server (session %s): %v", clientAddr, err)
-				return
-			}
-			handleServerPacket(s, proxyConn, buf, n)
-		}
-	}()
-
+	s.touch()
+	s.goroutineWG.Add(2)
+	go s.readBackend()
+	go s.watchContext(ctx)
 	return s, nil
 }
 
-func handleServerPacket(s *session, proxyConn *net.UDPConn, data []byte, n int) {
-	logrus.Debugf("Received %d bytes from server for client %s", n, s.clientAddr.String())
-	// logrus.Debugf("Payload: % X", data)
-	s.touchActivity()
-	updateLargestServerPacketSize(n)
-
-	if s.module.DetectClose(data[:n]) {
-		logrus.Infof("Closing connection for client %s",
-			s.clientAddr.String(),
-		)
-		go delayedSessionRemoval(s.clientAddr.String())
-	}
-
-	if _, werr := proxyConn.WriteToUDP(data[:n], s.clientAddr); werr != nil {
-		logrus.Errorf("Error forwarding to client %s: %v", s.clientAddr, werr)
-		return
+func (s *Session) watchContext(ctx context.Context) {
+	defer s.goroutineWG.Done()
+	select {
+	case <-ctx.Done():
+		s.closeResources()
+	case <-s.done:
 	}
 }
 
-func (s *session) touchActivity() {
-	s.lastActivity = time.Now()
-}
+func (s *Session) readBackend() {
+	defer s.goroutineWG.Done()
+	defer close(s.done)
+	defer s.closeResources()
 
-func (s *session) idleMonitor(clientKey string) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
+	buffer := make([]byte, s.maxPacket)
 	for {
-		select {
-		case <-ticker.C:
-			if time.Since(s.lastActivity) > config.GlobalConfig.IdleTimeout {
-				logrus.Infof("Session %s idle for over %v, removing", clientKey, config.GlobalConfig.IdleTimeout)
-				removeSession(clientKey)
-				return
-			}
-		case <-s.stopMonitor:
-			logrus.Infof("Stopping idle monitor for %s", clientKey)
+		n, _, flags, _, err := s.upstream.ReadMsgUDP(buffer, nil)
+		if err != nil {
+			return
+		}
+		if n == 0 || flags&unix.MSG_TRUNC != 0 {
+			continue
+		}
+		if !s.touch() {
+			return
+		}
+		if _, err := s.publicConn.WriteToUDP(buffer[:n], s.clientAddr); err != nil {
 			return
 		}
 	}
 }
 
-func delayedSessionRemoval(clientKey string) {
-	time.Sleep(1 * time.Second)
-	sess, ok := getSession(clientKey)
-	if ok {
-		close(sess.stopMonitor)
+func (s *Session) RecordActivity() error {
+	if !s.touch() {
+		return ErrSessionClosed
 	}
-	removeSession(clientKey)
+	return nil
 }
 
-func HandleClientPacket(
-	proxyConn *net.UDPConn,
-	serverAddr *net.UDPAddr,
-	clientAddr *net.UDPAddr,
-	data []byte,
-	module games.GameModule,
-) {
-	logrus.Debugf("Received %d bytes from client %s", len(data), clientAddr)
-	// logrus.Debugf("Payload: % X", data)
-	sess, ok := getSession(clientAddr.String())
-	if ok {
-		sess.touchActivity()
-		if _, werr := sess.serverConn.WriteToUDP(data, serverAddr); werr != nil {
-			logrus.Errorf("Error forwarding data to server: %v", werr)
+func (s *Session) ForwardClient(data []byte) error {
+	if err := s.RecordActivity(); err != nil {
+		return err
+	}
+	if _, err := s.upstream.Write(data); err != nil {
+		if s.closed.Load() {
+			return ErrSessionClosed
 		}
-		return
+		s.closeResources()
+		return fmt.Errorf("forward client packet: %w", err)
 	}
-	if !module.DetectStart(data) {
-		logrus.Debugf("Ignoring new connection from %s: no start signature found", clientAddr)
-		return
-	}
-	if sessionCount() >= config.GlobalConfig.MaxSessions {
-		logrus.Infof("Max sessions (%d) reached. Refusing new session for %s", config.GlobalConfig.MaxSessions, clientAddr)
-		return
-	}
-	logrus.Infof("Creating new session for %s", clientAddr)
-	newSess, err := createSession(clientAddr, serverAddr, proxyConn, config.GlobalConfig.MaxPacketSize, module)
-	if err != nil {
-		logrus.Errorf("Failed to create session for %s: %v", clientAddr, err)
-		return
-	}
-	addSession(clientAddr.String(), newSess)
-	if _, werr := newSess.serverConn.WriteToUDP(data, serverAddr); werr != nil {
-		logrus.Errorf("Error forwarding data to server: %v", werr)
-	}
+	return nil
 }
 
-func UpdateLargestClientPacketSize(n int) {
-	if n > largestClientPacketSize {
-		largestClientPacketSize = n
-		logrus.Debugf("Largest client packet size: %d", largestClientPacketSize)
+func (s *Session) touch() bool {
+	s.activityMu.Lock()
+	defer s.activityMu.Unlock()
+	if s.closed.Load() {
+		return false
 	}
+	s.lastActivity.Store(s.clock().UnixNano())
+	return true
 }
 
-func updateLargestServerPacketSize(n int) {
-	if n > largestServerPacketSize {
-		largestServerPacketSize = n
-		logrus.Debugf("Largest server packet size: %d", largestServerPacketSize)
+func (s *Session) LastActivity() time.Time {
+	return time.Unix(0, s.lastActivity.Load())
+}
+
+func (s *Session) TryExpire(cutoff time.Time) bool {
+	s.activityMu.Lock()
+	if s.closed.Load() || !s.LastActivity().Before(cutoff) {
+		s.activityMu.Unlock()
+		return false
 	}
+	s.closed.Store(true)
+	s.activityMu.Unlock()
+
+	s.closeOnce.Do(s.closeSocket)
+	return true
+}
+
+func (s *Session) Done() <-chan struct{} {
+	return s.done
+}
+
+func (s *Session) closeSocket() {
+	s.cancel()
+	_ = s.upstream.Close()
+}
+
+func (s *Session) closeResources() {
+	s.closeOnce.Do(func() {
+		s.activityMu.Lock()
+		s.closed.Store(true)
+		s.activityMu.Unlock()
+		s.closeSocket()
+	})
+}
+
+func (s *Session) Close() error {
+	s.closeResources()
+	s.goroutineWG.Wait()
+	return nil
 }

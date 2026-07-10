@@ -1,0 +1,100 @@
+name: Publish release image
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: buggy121/game-server-snooze
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify release candidate
+        run: |
+          ./scripts/validate-semver-tag.sh "$GITHUB_REF_NAME"
+          test -z "$(gofmt -l cmd pkg)"
+          go mod verify
+          go vet ./...
+          go test -race -shuffle=on -count=1 -timeout=90s ./...
+          go build -trimpath -o /tmp/game-server-snooze ./cmd
+
+  publish:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Log in to Docker Hub
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Refuse to overwrite an existing version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          token="$(curl -fsS --get 'https://auth.docker.io/token' \
+            --data-urlencode 'service=registry.docker.io' \
+            --data-urlencode "scope=repository:${IMAGE_NAME}:pull" | \
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            --oauth2-bearer "$token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://registry-1.docker.io/v2/${IMAGE_NAME}/manifests/${tag}")"
+          case "$status" in
+            404) ;;
+            200) echo "Refusing to overwrite existing image tag ${IMAGE_NAME}:${tag}" >&2; exit 1 ;;
+            *) echo "Registry lookup failed closed with HTTP ${status}" >&2; exit 1 ;;
+          esac
+      - name: Generate immutable image tags
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=semver,pattern={{major}},enable=${{ !contains(github.ref_name, '-') }}
+            type=sha,format=short,prefix=sha-
+      - name: Build and publish multi-architecture image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            VCS_REF=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+      - name: Verify published manifest
+        run: |
+          docker buildx imagetools inspect "${IMAGE_NAME}:${GITHUB_REF_NAME#v}"
+          echo "Published digest: ${{ steps.build.outputs.digest }}"

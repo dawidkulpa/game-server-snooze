@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify release-tag validator
+        run: ./scripts/validate-semver-tag_test.sh
+      - name: Verify formatting
+        run: test -z "$(gofmt -l cmd pkg)"
+      - name: Verify modules
+        run: go mod verify
+      - name: Vet
+        run: go vet ./...
+      - name: Test with race detector
+        run: go test -race -shuffle=on -count=1 -timeout=90s -coverprofile=coverage.out ./...
+      - name: Build production binary
+        run: go build -trimpath -o /tmp/game-server-snooze ./cmd
+
+  container-amd64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build native image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          tags: game-server-snooze:ci
+          build-args: |
+            VERSION=ci
+            VCS_REF=${{ github.sha }}
+      - name: Verify non-root runtime and health
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect game-server-snooze:ci --format '{{.Config.User}}')" = "65532:65532"
+          trap 'docker rm -f game-server-snooze-ci >/dev/null 2>&1 || true' EXIT
+          docker run -d --name game-server-snooze-ci \
+            --health-interval=1s --health-timeout=2s --health-retries=5 \
+            -e SERVER_ADDR=127.0.0.1:8211 \
+            -e PTERO_BASE_URL=http://127.0.0.1:1 \
+            -e PTERO_API_TOKEN=ci-placeholder \
+            -e PTERO_SERVER_ID=ci-placeholder \
+            -e HEALTH_ADDR=127.0.0.1:8080 \
+            game-server-snooze:ci
+          for attempt in $(seq 1 30); do
+            status="$(docker inspect game-server-snooze-ci --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}')"
+            if [ "$status" = healthy ]; then
+              break
+            fi
+            if [ "$status" = unhealthy ]; then
+              docker logs game-server-snooze-ci
+              exit 1
+            fi
+            sleep 1
+          done
+          test "$(docker inspect game-server-snooze-ci --format '{{.State.Health.Status}}')" = healthy
+          docker stop --time 10 game-server-snooze-ci
