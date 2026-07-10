@@ -32,7 +32,7 @@ Run the service only with non-production placeholders or an isolated fake API. N
 
 1. Ensure `DOCKER_USERNAME` and `DOCKER_PASSWORD` repository secrets exist; `DOCKER_PASSWORD` must contain a scoped Docker Hub access token.
 2. Merge the reviewed public PR after CI passes.
-3. Create an explicit protected SemVer candidate tag such as `v0.5.0-rc.1` on that reviewed commit.
+3. Publish a GitHub pre-release for an explicit protected SemVer candidate tag such as `0.5.0-rc.1` on that reviewed commit. Release tags MUST NOT use a leading `v` prefix.
 4. Record the successful release workflow, immutable image digest, and amd64/arm64 manifest in the deployment PR.
 
 ## Live validation handoff

@@ -1,9 +1,8 @@
 name: Publish release image
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -54,7 +53,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
+          tag="$GITHUB_REF_NAME"
           token="$(curl -fsS --get 'https://auth.docker.io/token' \
             --data-urlencode 'service=registry.docker.io' \
             --data-urlencode "scope=repository:${IMAGE_NAME}:pull" | \
@@ -96,5 +95,5 @@ jobs:
           sbom: true
       - name: Verify published manifest
         run: |
-          docker buildx imagetools inspect "${IMAGE_NAME}:${GITHUB_REF_NAME#v}"
+          docker buildx imagetools inspect "${IMAGE_NAME}:${GITHUB_REF_NAME}"
           echo "Published digest: ${{ steps.build.outputs.digest }}"
