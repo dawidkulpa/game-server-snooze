@@ -138,7 +138,10 @@ func (proxy *Proxy) Serve(ctx context.Context) error {
 	state, err := proxy.options.Controller.Status(serveCtx)
 	if err != nil {
 		logrus.WithError(err).Warn("Could not determine initial Pterodactyl state; keeping wake gate closed")
-	} else if state == server.StateRunning {
+	} else {
+		logrus.WithField("state", state).Info("Initial Pterodactyl state detected")
+	}
+	if err == nil && state == server.StateRunning {
 		proxy.mu.Lock()
 		proxy.backendRunning = true
 		proxy.backendReady = proxy.options.Readiness == nil
@@ -208,7 +211,7 @@ func (proxy *Proxy) handleClientPacket(clientAddr *net.UDPAddr, packet []byte) {
 		return
 	}
 
-	createdSession, created, _, err := proxy.store.GetOrCreate(key, func() (*session.Session, error) {
+	createdSession, created, activeCount, err := proxy.store.GetOrCreate(key, func() (*session.Session, error) {
 		return session.NewSession(proxy.ctx, session.SessionOptions{
 			ClientAddr:    clientAddr,
 			BackendAddr:   proxy.options.BackendAddr,
@@ -227,6 +230,7 @@ func (proxy *Proxy) handleClientPacket(clientAddr *net.UDPAddr, packet []byte) {
 		return
 	}
 	if created {
+		logrus.WithField("active_sessions", activeCount).Info("UDP session opened")
 		proxy.cancelAutoStop()
 		proxy.watchSession(key, createdSession)
 	}
@@ -256,6 +260,9 @@ func (proxy *Proxy) watchSession(key string, active *session.Session) {
 			logrus.WithError(err).Warn("Could not remove closed UDP session")
 		}
 		proxy.removeQueue(active)
+		if removed {
+			logrus.WithField("active_sessions", count).Info("UDP session closed")
+		}
 		if removed && count == 0 && proxy.ctx.Err() == nil {
 			proxy.scheduleAutoStop()
 		}
@@ -395,7 +402,11 @@ func (proxy *Proxy) ensureRunning() error {
 			case server.StateOffline:
 				proxy.markBackendNotRunning()
 				if !startSent {
+					logrus.Info("Requesting Palworld start")
 					startErr := proxy.options.Controller.Start(ctx)
+					if startErr == nil {
+						logrus.Info("Palworld start request accepted")
+					}
 					if startErr != nil && server.IsPermanent(startErr) {
 						return fmt.Errorf("start Pterodactyl server: %w", startErr)
 					}
@@ -439,7 +450,10 @@ func (proxy *Proxy) openStartupGate() {
 	proxy.backendRunning = true
 	// Keep ingress gated while flushing so a newly arrived datagram cannot
 	// overtake an older buffered handshake datagram for the same session.
+	queuedSessions := len(proxy.queues)
+	queuedPackets := 0
 	for active, queue := range proxy.queues {
+		queuedPackets += len(queue.packets)
 		for _, packet := range queue.packets {
 			if err := active.ForwardClient(packet); err != nil {
 				break
@@ -451,7 +465,14 @@ func (proxy *Proxy) openStartupGate() {
 	proxy.backendReady = true
 	proxy.mu.Unlock()
 
-	if proxy.store.Len() == 0 {
+	activeSessions := proxy.store.Len()
+	logrus.WithFields(logrus.Fields{
+		"active_sessions": activeSessions,
+		"queued_sessions": queuedSessions,
+		"queued_packets":  queuedPackets,
+	}).Info("Palworld backend ready; UDP forwarding enabled")
+
+	if activeSessions == 0 {
 		proxy.scheduleAutoStop()
 	}
 }
@@ -477,18 +498,26 @@ func (proxy *Proxy) runSweeper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			proxy.refreshPendingSessions()
-			expired, count, err := proxy.store.ExpireIdle(now.Add(-proxy.options.IdleTimeout))
-			if err != nil {
-				logrus.WithError(err).Warn("Could not close every idle session")
-			}
-			if expired > 0 {
-				proxy.removeClosedQueues()
-			}
-			if expired > 0 && count == 0 {
-				proxy.scheduleAutoStop()
-			}
+			proxy.expireIdleSessions(now)
 		}
+	}
+}
+
+func (proxy *Proxy) expireIdleSessions(now time.Time) {
+	proxy.refreshPendingSessions()
+	expired, count, err := proxy.store.ExpireIdle(now.Add(-proxy.options.IdleTimeout))
+	if err != nil {
+		logrus.WithError(err).Warn("Could not close every idle session")
+	}
+	if expired > 0 {
+		proxy.removeClosedQueues()
+		logrus.WithFields(logrus.Fields{
+			"expired_sessions": expired,
+			"active_sessions":  count,
+		}).Info("Idle UDP sessions expired")
+	}
+	if expired > 0 && count == 0 {
+		proxy.scheduleAutoStop()
 	}
 }
 
@@ -507,9 +536,13 @@ func (proxy *Proxy) removeClosedQueues() {
 
 func (proxy *Proxy) cancelAutoStop() {
 	proxy.mu.Lock()
-	defer proxy.mu.Unlock()
+	hadPendingTimer := proxy.stopTimer != nil
 	proxy.stopGeneration++
 	proxy.stopAutoStopTimerLocked()
+	proxy.mu.Unlock()
+	if hadPendingTimer {
+		logrus.Info("Palworld auto-stop cancelled by new UDP session")
+	}
 }
 
 func (proxy *Proxy) scheduleAutoStop() {
@@ -522,7 +555,12 @@ func (proxy *Proxy) scheduleAutoStop() {
 	generation := proxy.stopGeneration
 	proxy.stopAutoStopTimerLocked()
 	proxy.scheduleAutoStopAttemptLocked(generation, 1, proxy.options.AutoStopDelay)
+	delay := proxy.options.AutoStopDelay
 	proxy.mu.Unlock()
+	logrus.WithFields(logrus.Fields{
+		"active_sessions": 0,
+		"delay":           delay.String(),
+	}).Info("Palworld auto-stop scheduled")
 }
 
 func (proxy *Proxy) stopAutoStopTimerLocked() {
@@ -556,10 +594,12 @@ func (proxy *Proxy) runAutoStopAttempt(generation uint64, attempt int) {
 	}
 	proxy.mu.Unlock()
 
+	logrus.WithField("attempt", attempt).Info("Requesting Palworld auto-stop")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	err := proxy.options.Controller.Stop(ctx)
 	cancel()
 	if err == nil {
+		logrus.WithField("attempt", attempt).Info("Palworld auto-stop request accepted")
 		proxy.markBackendNotRunning()
 		proxy.mu.Lock()
 		if generation == proxy.stopGeneration {

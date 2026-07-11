@@ -14,6 +14,10 @@
 
 The proxy uses observed UDP traffic, not player identities or Palworld REST/RCON, to decide when a session is idle. Keep the backend gameplay port private so players cannot bypass the proxy.
 
+### Operational lifecycle logs
+
+At the default `info` level, the proxy logs UDP session creation/removal, idle-expiry counts, backend readiness, auto-stop scheduling/cancellation, and start/stop request outcomes. A UDP session is an observed source flow, not an authenticated Palworld player. Lifecycle entries use bounded counters, delays, and attempts; they do not include client IP addresses, private backend/controller addresses, credentials, or Pterodactyl identifiers.
+
 ## Configuration
 
 Configuration is read from `config.yaml` in the process working directory. Environment variables override YAML values. Invalid addresses, durations, limits, policies, or required Pterodactyl values stop startup with an explicit error.

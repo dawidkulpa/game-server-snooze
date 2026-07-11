@@ -60,6 +60,7 @@ Modernize `game-server-snooze` so current Palworld clients can connect through a
 | FR-028 | The private deployment Compose MUST retain its existing UDP `8212:8212`, `LISTEN_ADDR=:8212`, private gameplay backend, and environment-token mechanism, while updating `PTERO_SERVER_ID` to the deployment-provided replacement value. |
 | FR-029 | The deployment MUST pin a candidate/versioned image tag rather than `latest`; production replicas MUST change from zero to one only for the live validation/deployment stage. |
 | FR-030 | The implementation MUST provide a controlled current-client validation sequence: stopped backend → connect attempt → one start request → readiness → successful join → disconnect/idle expiry → delayed stop. The agent MUST explicitly tell the user when to initiate the connection. |
+| FR-031 | Normal operation MUST emit structured info-level lifecycle logs for UDP session creation/removal, backend readiness, auto-stop scheduling/cancellation, and successful stop requests. Logs MUST include bounded operational fields such as active-session counts, expiry counts, delays, and attempts without exposing client IP addresses, backend addresses, credentials, or Pterodactyl identifiers. UDP sessions MUST NOT be described as authenticated players. |
 
 ## 5. Non-functional requirements
 
@@ -70,7 +71,7 @@ Modernize `game-server-snooze` so current Palworld clients can connect through a
 | NFR-003 | Integration tests MUST use real localhost UDP sockets and an `httptest` Pterodactyl API, not a real production server. |
 | NFR-004 | Tests MUST cover repeated connect/expire cycles and prove goroutine/socket counts do not grow without bound. Exact runtime goroutine counts may use a bounded tolerance. |
 | NFR-005 | Startup buffering, maximum sessions, packet size, and diagnostic logging MUST remain bounded under hostile input. |
-| NFR-006 | Logging MUST identify state transitions and client addresses sufficiently for diagnosis without emitting credentials or unlimited packet bodies. |
+| NFR-006 | Logging MUST identify lifecycle state transitions, bounded flow counts, and stop/start outcomes sufficiently for diagnosis without emitting client IP addresses, private backend/controller values, credentials, or unlimited packet bodies. |
 | NFR-007 | The implementation MUST remain a lightweight single-process proxy with no database, durable state store, or external queue. |
 | NFR-008 | Public documentation and examples MUST use generic placeholders and MUST NOT contain private hostnames, tokens, or the production server identifier. The production identifier belongs only in the private Compose repository. |
 | NFR-009 | Changes MUST receive independent spec-compliance and security/concurrency review of an immutable staged diff before commit. |
