@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"dkulpa.eu/game-server-snooze/pkg/config"
 	"dkulpa.eu/game-server-snooze/pkg/server"
 	"dkulpa.eu/game-server-snooze/pkg/session"
+	"github.com/sirupsen/logrus"
 )
 
 type testWakeDetector struct{}
@@ -35,6 +38,81 @@ func (probe *gatedReadiness) WaitReady(ctx context.Context) error {
 		return ctx.Err()
 	case <-probe.release:
 		return probe.result
+	}
+}
+
+func (probe *gatedReadiness) Probe(context.Context) error {
+	return probe.result
+}
+
+type healthReadiness struct {
+	mu           sync.Mutex
+	results      []error
+	probeCalls   int
+	probeCalled  chan struct{}
+	probeRelease chan struct{}
+	waitEntered  chan struct{}
+	waitRelease  chan struct{}
+}
+
+func (probe *healthReadiness) WaitReady(ctx context.Context) error {
+	if probe.waitRelease == nil {
+		return nil
+	}
+	select {
+	case probe.waitEntered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-probe.waitRelease:
+		return nil
+	}
+}
+
+func (probe *healthReadiness) Probe(context.Context) error {
+	probe.mu.Lock()
+	probe.probeCalls++
+	var result error
+	if len(probe.results) > 0 {
+		result = probe.results[0]
+		probe.results = probe.results[1:]
+	}
+	probe.mu.Unlock()
+	select {
+	case probe.probeCalled <- struct{}{}:
+	default:
+	}
+	if probe.probeRelease != nil {
+		<-probe.probeRelease
+	}
+	return result
+}
+
+type blockingHealthReadiness struct {
+	entered chan struct{}
+	release chan struct{}
+	next    chan struct{}
+}
+
+func (probe *blockingHealthReadiness) WaitReady(context.Context) error { return nil }
+
+func (probe *blockingHealthReadiness) Probe(ctx context.Context) error {
+	select {
+	case probe.entered <- struct{}{}:
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-probe.release:
+			return errors.New("stale timeout")
+		}
+	default:
+		select {
+		case probe.next <- struct{}{}:
+		default:
+		}
+		return nil
 	}
 }
 
@@ -123,6 +201,332 @@ func (controller *fakeController) setState(state server.State) {
 }
 
 type testPermanentError struct{ message string }
+
+func TestFinishStartupRetriggersReadinessForQueuedRecoveryPacket(t *testing.T) {
+	instance := &Proxy{
+		startupRunning:    true,
+		startupGeneration: 7,
+		queues: map[*session.Session]*packetQueue{
+			nil: {packets: [][]byte{{0x01}}, bytes: 1},
+		},
+		queuedBytes: 1,
+	}
+	if !instance.completeStartup(7) {
+		t.Fatal("queued recovery did not request a new readiness generation")
+	}
+	instance.mu.Lock()
+	running := instance.startupRunning
+	generation := instance.startupGeneration
+	instance.mu.Unlock()
+	if running || generation != 7 {
+		t.Fatalf("startup completion state is invalid: running=%v generation=%d", running, generation)
+	}
+}
+
+func TestBackendHealthFailuresResetAcrossReadinessGenerations(t *testing.T) {
+	failures := backendHealthFailures{}
+	if count := failures.record(7); count != 1 {
+		t.Fatalf("first generation failure count = %d, want 1", count)
+	}
+	if count := failures.record(7); count != 2 {
+		t.Fatalf("second same-generation failure count = %d, want 2", count)
+	}
+	if count := failures.record(9); count != 1 {
+		t.Fatalf("first new-generation failure count = %d, want 1", count)
+	}
+}
+
+func TestBackendHealthFailureClassDoesNotExposeNetworkAddresses(t *testing.T) {
+	privateEndpoint := "192.168.50.52:27015"
+	err := &net.OpError{
+		Op:   "read",
+		Net:  "udp",
+		Addr: &net.UDPAddr{IP: net.ParseIP("192.168.50.52"), Port: 27015},
+		Err:  errors.New("private endpoint " + privateEndpoint),
+	}
+	classification := backendHealthFailureClass(err)
+	if strings.Contains(classification, privateEndpoint) || classification != "probe_failure" {
+		t.Fatalf("unsafe or unexpected health failure classification: %q", classification)
+	}
+}
+
+func TestBackendHealthMonitorClosesReadyGateAfterConsecutiveFailures(t *testing.T) {
+	logger := logrus.StandardLogger()
+	oldOutput, oldLevel, oldFormatter := logger.Out, logger.Level, logger.Formatter
+	var output bytes.Buffer
+	logger.SetOutput(&output)
+	logger.SetLevel(logrus.WarnLevel)
+	logger.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
+	t.Cleanup(func() {
+		logger.SetOutput(oldOutput)
+		logger.SetLevel(oldLevel)
+		logger.SetFormatter(oldFormatter)
+	})
+	privateEndpoint := "192.168.50.52:27015"
+	probe := &healthReadiness{
+		results: []error{
+			errors.New("first timeout from " + privateEndpoint),
+			errors.New("second timeout from " + privateEndpoint),
+			errors.New("third timeout from " + privateEndpoint),
+		},
+		probeCalled:  make(chan struct{}, 4),
+		probeRelease: make(chan struct{}, 3),
+	}
+	store, err := session.NewStore(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	instance := &Proxy{
+		ctx:            ctx,
+		store:          store,
+		backendReady:   true,
+		backendRunning: true,
+		options: Options{
+			Readiness:           probe,
+			StartupPollInterval: time.Millisecond,
+		},
+	}
+	done := make(chan struct{})
+	instance.wg.Add(1)
+	go func() {
+		instance.runBackendHealthMonitor()
+		close(done)
+	}()
+	for range 3 {
+		select {
+		case <-probe.probeCalled:
+		case <-time.After(time.Second):
+			t.Fatal("backend health probe was not called")
+		}
+		probe.probeRelease <- struct{}{}
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		instance.mu.Lock()
+		ready := instance.backendReady
+		instance.mu.Unlock()
+		if !ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backend readiness gate remained open after consecutive health failures")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("backend health monitor did not stop after cancellation")
+	}
+	logged := output.String()
+	if strings.Contains(logged, privateEndpoint) {
+		t.Fatalf("backend health logging exposed private endpoint: %q", logged)
+	}
+	if !strings.Contains(logged, "failure_class=probe_failure") || !strings.Contains(logged, "failure_count=1") {
+		t.Fatalf("backend health logging lacks bounded failure metadata: %q", logged)
+	}
+}
+
+func TestBackendHealthLossBuffersNextPacketUntilReadinessRecovers(t *testing.T) {
+	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	public, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer public.Close()
+	store, err := session.NewStore(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := &healthReadiness{
+		results: []error{
+			errors.New("first timeout"),
+			errors.New("second timeout"),
+			errors.New("third timeout"),
+		},
+		probeCalled: make(chan struct{}, 4),
+		waitEntered: make(chan struct{}, 1),
+		waitRelease: make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	instance := &Proxy{
+		ctx:                 ctx,
+		store:               store,
+		backendReady:        true,
+		backendRunning:      true,
+		readinessGeneration: 1,
+		queues:              make(map[*session.Session]*packetQueue),
+		options: Options{
+			Listener:                     public,
+			BackendAddr:                  backend.LocalAddr().(*net.UDPAddr),
+			Controller:                   newFakeController(server.StateRunning),
+			Detector:                     testWakeDetector{},
+			Readiness:                    probe,
+			MaxPacketSize:                1024,
+			StartupTimeout:               time.Second,
+			StartupPollInterval:          5 * time.Millisecond,
+			StartupBufferPackets:         4,
+			StartupBufferBytesPerSession: 4096,
+			StartupBufferBytesGlobal:     8192,
+		},
+	}
+	clientAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 23456}
+	instance.handleClientPacket(clientAddr, []byte("before-loss"))
+	buffer := make([]byte, 128)
+	_ = backend.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err := backend.ReadFromUDP(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buffer[:n]); got != "before-loss" {
+		t.Fatalf("first backend packet = %q", got)
+	}
+
+	instance.wg.Add(1)
+	go instance.runBackendHealthMonitor()
+	for range backendHealthFailureThreshold {
+		select {
+		case <-probe.probeCalled:
+		case <-time.After(time.Second):
+			t.Fatal("backend health probe was not called")
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		instance.mu.Lock()
+		ready := instance.backendReady
+		instance.mu.Unlock()
+		if !ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backend gate did not close")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	instance.handleClientPacket(clientAddr, []byte("after-loss"))
+	select {
+	case <-probe.waitEntered:
+	case <-time.After(time.Second):
+		t.Fatal("recovery readiness did not start")
+	}
+	_ = backend.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, _, err := backend.ReadFromUDP(buffer); err == nil {
+		t.Fatal("packet reached backend while readiness gate was closed")
+	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("read closed backend: %v", err)
+	}
+	close(probe.waitRelease)
+	_ = backend.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err = backend.ReadFromUDP(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buffer[:n]); got != "after-loss" {
+		t.Fatalf("flushed backend packet = %q", got)
+	}
+
+	cancel()
+	_ = store.CloseAll()
+	instance.wg.Wait()
+}
+
+func TestBackendHealthMonitorKeepsGateOpenAfterTransientFailure(t *testing.T) {
+	probe := &healthReadiness{
+		results:     []error{errors.New("transient timeout"), nil},
+		probeCalled: make(chan struct{}, 4),
+	}
+	store, err := session.NewStore(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	instance := &Proxy{
+		ctx:            ctx,
+		store:          store,
+		backendReady:   true,
+		backendRunning: true,
+		options: Options{
+			Readiness:           probe,
+			StartupPollInterval: time.Millisecond,
+		},
+	}
+	instance.wg.Add(1)
+	go instance.runBackendHealthMonitor()
+	for range 2 {
+		select {
+		case <-probe.probeCalled:
+		case <-time.After(time.Second):
+			t.Fatal("backend health probe was not called")
+		}
+	}
+	instance.mu.Lock()
+	ready := instance.backendReady
+	instance.mu.Unlock()
+	if !ready {
+		t.Fatal("backend readiness gate closed after a single transient failure")
+	}
+	cancel()
+	instance.wg.Wait()
+}
+
+func TestBackendHealthMonitorIgnoresFailedProbeFromOlderReadinessGeneration(t *testing.T) {
+	probe := &blockingHealthReadiness{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		next:    make(chan struct{}, 1),
+	}
+	store, err := session.NewStore(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	instance := &Proxy{
+		ctx:                 ctx,
+		store:               store,
+		backendReady:        true,
+		readinessGeneration: 1,
+		options: Options{
+			Readiness:           probe,
+			StartupPollInterval: 10 * time.Millisecond,
+		},
+	}
+	instance.wg.Add(1)
+	go instance.runBackendHealthMonitor()
+	select {
+	case <-probe.entered:
+	case <-time.After(time.Second):
+		t.Fatal("backend health probe did not start")
+	}
+	instance.mu.Lock()
+	instance.backendReady = false
+	instance.readinessGeneration++
+	instance.backendReady = true
+	instance.readinessGeneration++
+	instance.mu.Unlock()
+	close(probe.release)
+	select {
+	case <-probe.next:
+	case <-time.After(time.Second):
+		t.Fatal("backend health monitor did not continue after stale probe")
+	}
+	instance.mu.Lock()
+	ready := instance.backendReady
+	instance.mu.Unlock()
+	if !ready {
+		t.Fatal("stale failed probe closed a newer readiness generation")
+	}
+	cancel()
+	instance.wg.Wait()
+}
 
 func (err testPermanentError) Error() string   { return err.message }
 func (err testPermanentError) Permanent() bool { return true }

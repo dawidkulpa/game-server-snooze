@@ -27,6 +27,55 @@ func NewA2SProbe(address string, pollInterval time.Duration) (*A2SProbe, error) 
 	return &A2SProbe{address: resolved, pollInterval: pollInterval}, nil
 }
 
+func (probe *A2SProbe) Probe(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("probe A2S readiness: %w", err)
+	}
+	conn, err := net.DialUDP("udp", nil, probe.address)
+	if err != nil {
+		return fmt.Errorf("dial A2S endpoint: %w", err)
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(probe.pollInterval)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("set A2S probe deadline: %w", err)
+	}
+	query := append([]byte(nil), a2sInfoQuery...)
+	response := make([]byte, 1400)
+	for attempts := 0; attempts < 2; attempts++ {
+		if _, err := conn.Write(query); err != nil {
+			return fmt.Errorf("write A2S probe: %w", err)
+		}
+		n, _, flags, _, err := conn.ReadMsgUDP(response, nil)
+		if err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("probe A2S readiness: %w", ctx.Err())
+			}
+			return fmt.Errorf("read A2S probe: %w", err)
+		}
+		if flags&unix.MSG_TRUNC != 0 || n < 5 || response[0] != 0xff || response[1] != 0xff || response[2] != 0xff || response[3] != 0xff {
+			return fmt.Errorf("invalid A2S response")
+		}
+		switch response[4] {
+		case 0x49:
+			if validA2SInfo(response[:n]) {
+				return nil
+			}
+			return fmt.Errorf("invalid A2S info response")
+		case 0x41:
+			if attempts == 0 && n >= 9 {
+				query = append(append([]byte(nil), a2sInfoQuery...), response[5:9]...)
+				continue
+			}
+		}
+		return fmt.Errorf("unexpected A2S response type 0x%02x", response[4])
+	}
+	return fmt.Errorf("A2S probe challenge did not produce an info response")
+}
+
 func (probe *A2SProbe) WaitReady(ctx context.Context) error {
 	conn, err := net.DialUDP("udp", nil, probe.address)
 	if err != nil {
