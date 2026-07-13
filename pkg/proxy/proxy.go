@@ -451,6 +451,11 @@ func (proxy *Proxy) ensureRunning() error {
 					case <-timer.C:
 					}
 				}
+				if proxy.options.Readiness != nil {
+					if err := proxy.options.Readiness.Probe(ctx); err != nil {
+						return fmt.Errorf("recheck Palworld application readiness after settle: %w", err)
+					}
+				}
 				proxy.openStartupGate()
 				return nil
 			case server.StateOffline:
@@ -619,6 +624,7 @@ func (proxy *Proxy) closeBackendGate(generation uint64, failureClass string) {
 		return
 	}
 	proxy.backendReady = false
+	proxy.backendRunning = false
 	proxy.readinessGeneration++
 	proxy.stopGeneration++
 	proxy.stopAutoStopTimerLocked()
