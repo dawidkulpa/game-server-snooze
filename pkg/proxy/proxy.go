@@ -412,6 +412,7 @@ func (proxy *Proxy) failStartup(generation uint64, permanent bool) {
 	proxy.queuedBytes = 0
 	if proxy.startupGeneration == generation {
 		proxy.startupRunning = false
+		proxy.backendRunning = false
 		if permanent {
 			proxy.startupBlockedUntil = time.Now().Add(proxy.options.StartupFailureCooldown)
 		}
