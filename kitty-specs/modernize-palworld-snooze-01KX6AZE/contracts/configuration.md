@@ -17,8 +17,8 @@ Existing settings remain supported. New settings use YAML snake_case and upperca
 | `startup_buffer_packets` | `STARTUP_BUFFER_PACKETS` | integer | `32` | > 0 |
 | `startup_buffer_bytes_per_session` | `STARTUP_BUFFER_BYTES_PER_SESSION` | integer | `262144` | >= `max_packet_size` |
 | `startup_buffer_bytes_global` | `STARTUP_BUFFER_BYTES_GLOBAL` | integer | `4194304` | >= per-session bytes and `max_packet_size` |
-| `backend_readiness_mode` | `BACKEND_READINESS_MODE` | enum | `a2s` | `a2s` or compatibility `delay` |
-| `backend_readiness_addr` | `BACKEND_READINESS_ADDR` | string | backend host, UDP 27015 | empty or valid UDP address |
+| `backend_readiness_mode` | `BACKEND_READINESS_MODE` | enum | `pterodactyl` | `pterodactyl`, legacy `a2s`, or compatibility `delay` |
+| `backend_readiness_addr` | `BACKEND_READINESS_ADDR` | string | empty | empty unless `a2s`; then a valid UDP address |
 | `wake_policy` | `WAKE_POLICY` | enum | `signature` | `signature` or `any` |
 | `wake_signatures` | `WAKE_SIGNATURES` | string list | Palworld compatibility prefix | non-empty decoded hex prefixes under signature policy |
 | `log_unmatched_prefixes` | `LOG_UNMATCHED_PREFIXES` | boolean | `false` | strict boolean |
