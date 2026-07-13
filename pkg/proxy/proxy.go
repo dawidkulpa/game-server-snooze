@@ -407,6 +407,8 @@ func (proxy *Proxy) completeStartup(generation uint64) bool {
 func (proxy *Proxy) failStartup(generation uint64, permanent bool) {
 	proxy.admissionMu.Lock()
 	defer proxy.admissionMu.Unlock()
+	proxy.forwardingMu.Lock()
+	defer proxy.forwardingMu.Unlock()
 	proxy.mu.Lock()
 	proxy.queues = make(map[*session.Session]*packetQueue)
 	proxy.queuedBytes = 0
