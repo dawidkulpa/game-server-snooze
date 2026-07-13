@@ -9,7 +9,16 @@ import (
 	"time"
 
 	"dkulpa.eu/game-server-snooze/pkg/config"
+	"dkulpa.eu/game-server-snooze/pkg/server"
 )
+
+type readinessController struct{ state server.State }
+
+func (controller readinessController) Status(context.Context) (server.State, error) {
+	return controller.state, nil
+}
+func (readinessController) Start(context.Context) error { return nil }
+func (readinessController) Stop(context.Context) error  { return nil }
 
 func TestNewPalworldDetectorUsesConfiguredWakePolicy(t *testing.T) {
 	cfg := config.DefaultConfig()
@@ -42,7 +51,7 @@ func TestProxyOptionsCarryValidatedRuntimeConfiguration(t *testing.T) {
 	cfg.StartupBufferBytesPerSession = 12345
 	cfg.StartupBufferBytesGlobal = 54321
 
-	probe, err := newBackendReadiness(cfg, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8211})
+	probe, err := newBackendReadiness(cfg, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8211}, readinessController{state: server.StateRunning})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,18 +70,27 @@ func TestProxyOptionsCarryValidatedRuntimeConfiguration(t *testing.T) {
 	}
 }
 
-func TestNewBackendReadinessUsesA2SByDefaultAndAllowsDelayFallback(t *testing.T) {
+func TestNewBackendReadinessUsesPterodactylByDefaultAndAllowsExplicitFallbacks(t *testing.T) {
 	cfg := config.DefaultConfig()
 	backend := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8211}
-	probe, err := newBackendReadiness(cfg, backend)
+	controller := readinessController{state: server.StateRunning}
+	probe, err := newBackendReadiness(cfg, backend, controller)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if probe == nil {
-		t.Fatal("default a2s readiness produced no application probe")
+		t.Fatal("default Pterodactyl readiness produced no state probe")
+	}
+	if err := probe.Probe(context.Background()); err != nil {
+		t.Fatalf("default Pterodactyl readiness rejected running state: %v", err)
+	}
+	cfg.BackendReadinessMode = "a2s"
+	probe, err = newBackendReadiness(cfg, backend, controller)
+	if err != nil || probe == nil {
+		t.Fatalf("explicit A2S fallback failed: probe=%v err=%v", probe, err)
 	}
 	cfg.BackendReadinessMode = "delay"
-	probe, err = newBackendReadiness(cfg, backend)
+	probe, err = newBackendReadiness(cfg, backend, controller)
 	if err != nil {
 		t.Fatal(err)
 	}

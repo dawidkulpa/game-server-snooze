@@ -28,18 +28,21 @@ func newPalworldDetector(cfg config.Config) (*games.PalworldGame, error) {
 	})
 }
 
-func newBackendReadiness(cfg config.Config, backend *net.UDPAddr) (proxy.BackendReadiness, error) {
+func newBackendReadiness(cfg config.Config, backend *net.UDPAddr, controller server.Controller) (proxy.BackendReadiness, error) {
 	if cfg.BackendReadinessMode == "delay" {
 		return nil, nil
 	}
-	if cfg.BackendReadinessMode != "a2s" {
-		return nil, fmt.Errorf("unsupported backend readiness mode %q", cfg.BackendReadinessMode)
+	if cfg.BackendReadinessMode == "pterodactyl" {
+		return readiness.NewPterodactylProbe(controller, cfg.StartupPollInterval)
 	}
-	address := cfg.BackendReadinessAddr
-	if address == "" {
-		address = net.JoinHostPort(backend.IP.String(), "27015")
+	if cfg.BackendReadinessMode == "a2s" {
+		address := cfg.BackendReadinessAddr
+		if address == "" {
+			address = net.JoinHostPort(backend.IP.String(), "27015")
+		}
+		return readiness.NewA2SProbe(address, cfg.StartupPollInterval)
 	}
-	return readiness.NewA2SProbe(address, cfg.StartupPollInterval)
+	return nil, fmt.Errorf("unsupported backend readiness mode %q", cfg.BackendReadinessMode)
 }
 
 func proxyOptionsFromConfig(cfg config.Config, listener *net.UDPConn, backend *net.UDPAddr, controller server.Controller, detector proxy.WakeDetector, backendReadiness proxy.BackendReadiness) proxy.Options {
@@ -86,7 +89,7 @@ func run(parent context.Context) error {
 	if err != nil {
 		return fmt.Errorf("resolve Palworld backend: %w", err)
 	}
-	backendReadiness, err := newBackendReadiness(cfg, backendAddr)
+	backendReadiness, err := newBackendReadiness(cfg, backendAddr, controller)
 	if err != nil {
 		return fmt.Errorf("configure Palworld readiness: %w", err)
 	}

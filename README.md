@@ -8,7 +8,7 @@
 2. While Pterodactyl reports the backend offline, only a packet matching the configured Palworld wake policy can create a session.
 3. One Pterodactyl start request is shared by all accepted startup flows. A failed status query never triggers a power request; only a later confirmed `offline` state may start the server. Permanent panel/auth/schema failures apply a global five-second wake cooldown so unauthenticated UDP cannot generate one API request per packet.
 4. Client datagrams remain in bounded per-session and global buffers.
-5. By default, the proxy waits for both Pterodactyl `running` and a successful Steam A2S query before releasing buffered datagrams. A settle delay is applied afterward.
+5. By default, the proxy waits for Pterodactyl `running` before releasing buffered datagrams, then applies a settle delay. The Palworld egg emits its startup marker only after authenticated REST and the local gameplay UDP listener are ready.
 6. Each client `IP:port` owns a connected upstream UDP socket. Backend replies can therefore return only from the configured backend endpoint.
 7. Idle sessions close their sockets and reader goroutines. When the final session expires, a generation-safe timer starts. A new session invalidates that timer before a stop can be sent.
 
@@ -32,13 +32,13 @@ Configuration is read from `config.yaml` in the process working directory. Envir
 | `IDLE_TIMEOUT` | Inactivity before a ready flow is closed; pending startup flows remain bounded by `STARTUP_TIMEOUT` | `30s` |
 | `AUTO_STOP_DELAY` | Zero-session delay before Pterodactyl stop | `1m` |
 | `STARTUP_TIMEOUT` | Total Pterodactyl/readiness startup deadline | `5m` |
-| `STARTUP_POLL_INTERVAL` | Pterodactyl and A2S polling interval | `2s` |
+| `STARTUP_POLL_INTERVAL` | Pterodactyl/readiness polling interval | `2s` |
 | `STARTUP_SETTLE_DELAY` | Additional delay after application readiness | `5s` |
 | `STARTUP_BUFFER_PACKETS` | Packet limit per pending flow | `32` |
 | `STARTUP_BUFFER_BYTES_PER_SESSION` | Byte limit per pending flow; must be at least `MAX_PACKET_SIZE` | `262144` |
 | `STARTUP_BUFFER_BYTES_GLOBAL` | Byte limit across all pending flows; must hold at least one maximum packet | `4194304` |
-| `BACKEND_READINESS_MODE` | `a2s` or weaker `delay` compatibility mode | `a2s` |
-| `BACKEND_READINESS_ADDR` | Steam A2S endpoint; empty derives backend host with port 27015 | empty |
+| `BACKEND_READINESS_MODE` | `pterodactyl`, legacy `a2s`, or weaker `delay` compatibility mode | `pterodactyl` |
+| `BACKEND_READINESS_ADDR` | Legacy Steam A2S endpoint; valid only in `a2s` mode | empty |
 | `WAKE_POLICY` | `signature` for production or diagnostic `any` | `signature` |
 | `WAKE_SIGNATURES` | Comma-separated hexadecimal packet prefixes | historical Palworld prefix |
 | `LOG_UNMATCHED_PREFIXES` | Rate-limited unmatched prefix diagnostics | `false` |
@@ -53,9 +53,9 @@ Configuration is read from `config.yaml` in the process working directory. Envir
 
 ### Palworld readiness
 
-The default `a2s` mode sends the standard Steam `A2S_INFO` query to the Palworld query endpoint. It handles challenge responses and opens the startup gate only after an information response is received. This does not require or expose Palworld REST (`8212`) or RCON (`25575`). If the server uses a non-default query port, set `BACKEND_READINESS_ADDR` explicitly.
+The default `pterodactyl` mode opens the startup gate only after the panel reports `running`, then applies `STARTUP_SETTLE_DELAY`. The native Palworld 1.0 egg is responsible for the application-level half of this contract: it emits `PALWORLD_READY` only when authenticated private REST `/v1/api/info` succeeds and a marked game process owns a UDP listener on the gameplay port. Wings does not report the server as running before that marker.
 
-`delay` mode relies on Pterodactyl `running` plus `STARTUP_SETTLE_DELAY`. It is available for installations without A2S but cannot prove that Palworld has initialized its gameplay service.
+The proxy continues polling panel state after startup and closes the forwarding gate if the launcher/container leaves `running`. `a2s` remains only as an explicit compatibility mode for other server builds that actually expose Steam A2S. `delay` is a weaker compatibility mode with no ongoing readiness probe.
 
 ### Wake compatibility
 
@@ -81,7 +81,7 @@ docker run --rm \
   -p 8211:8211/udp \
   -e LISTEN_ADDR=:8211 \
   -e SERVER_ADDR=192.0.2.10:8211 \
-  -e BACKEND_READINESS_ADDR=192.0.2.10:27015 \
+  -e BACKEND_READINESS_MODE=pterodactyl \
   -e PTERO_BASE_URL=https://panel.example.com \
   -e PTERO_API_TOKEN='[REDACTED]' \
   -e PTERO_SERVER_ID=example-server-id \
@@ -128,5 +128,5 @@ Automated tests cannot prove a current retail Palworld client handshake. A relea
 1. Confirm the backend is stopped.
 2. Start the proxy and monitor its logs and Pterodactyl state.
 3. Connect only when the operator explicitly requests the client test.
-4. Verify one start request, A2S readiness, successful join, reconnect behavior, idle expiry, and delayed stop.
+4. Verify one start request, panel-state readiness after the egg marker, successful join, reconnect behavior, idle expiry, and delayed stop.
 5. If the default signature does not match, capture only the bounded diagnostic prefix, add it as a regression fixture, and publish a revised candidate.

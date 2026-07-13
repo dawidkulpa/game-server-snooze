@@ -20,6 +20,7 @@ type WakeDetector interface {
 
 type BackendReadiness interface {
 	WaitReady(context.Context) error
+	Probe(context.Context) error
 }
 
 type Options struct {
@@ -48,7 +49,41 @@ const (
 	maxAutoStopAttempts           = 3
 	defaultAutoStopRetryDelay     = 5 * time.Second
 	defaultStartupFailureCooldown = 5 * time.Second
+	backendHealthFailureThreshold = 3
 )
+
+type backendHealthFailures struct {
+	generation uint64
+	count      int
+}
+
+func (failures *backendHealthFailures) reset() {
+	failures.generation = 0
+	failures.count = 0
+}
+
+func (failures *backendHealthFailures) record(generation uint64) int {
+	if failures.generation != generation {
+		failures.generation = generation
+		failures.count = 0
+	}
+	failures.count++
+	return failures.count
+}
+
+func backendHealthFailureClass(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return "timeout"
+	}
+	return "probe_failure"
+}
 
 type packetQueue struct {
 	packets        [][]byte
@@ -65,7 +100,9 @@ type Proxy struct {
 
 	mu                  sync.Mutex
 	admissionMu         sync.Mutex
+	forwardingMu        sync.RWMutex
 	backendReady        bool
+	readinessGeneration uint64
 	backendRunning      bool
 	startupRunning      bool
 	startupGeneration   uint64
@@ -145,6 +182,9 @@ func (proxy *Proxy) Serve(ctx context.Context) error {
 		proxy.mu.Lock()
 		proxy.backendRunning = true
 		proxy.backendReady = proxy.options.Readiness == nil
+		if proxy.backendReady {
+			proxy.readinessGeneration++
+		}
 		proxy.mu.Unlock()
 		if proxy.options.Readiness != nil {
 			proxy.startServer()
@@ -153,6 +193,10 @@ func (proxy *Proxy) Serve(ctx context.Context) error {
 
 	proxy.wg.Add(2)
 	go proxy.runSweeper(serveCtx)
+	if proxy.options.Readiness != nil {
+		proxy.wg.Add(1)
+		go proxy.runBackendHealthMonitor()
+	}
 	go func() {
 		defer proxy.wg.Done()
 		<-serveCtx.Done()
@@ -279,6 +323,8 @@ func (proxy *Proxy) removeQueue(active *session.Session) {
 }
 
 func (proxy *Proxy) forwardOrQueue(active *session.Session, packet []byte) bool {
+	proxy.forwardingMu.RLock()
+	defer proxy.forwardingMu.RUnlock()
 	proxy.mu.Lock()
 	if !proxy.backendReady {
 		if err := active.RecordActivity(); err != nil {
@@ -343,21 +389,32 @@ func (proxy *Proxy) startServer() {
 }
 
 func (proxy *Proxy) finishStartup(generation uint64) {
-	proxy.mu.Lock()
-	if proxy.startupGeneration == generation {
-		proxy.startupRunning = false
+	if proxy.completeStartup(generation) {
+		proxy.startServer()
 	}
-	proxy.mu.Unlock()
+}
+
+func (proxy *Proxy) completeStartup(generation uint64) bool {
+	proxy.mu.Lock()
+	defer proxy.mu.Unlock()
+	if proxy.startupGeneration != generation {
+		return false
+	}
+	proxy.startupRunning = false
+	return !proxy.shuttingDown && !proxy.backendReady && len(proxy.queues) > 0 && !time.Now().Before(proxy.startupBlockedUntil)
 }
 
 func (proxy *Proxy) failStartup(generation uint64, permanent bool) {
 	proxy.admissionMu.Lock()
 	defer proxy.admissionMu.Unlock()
+	proxy.forwardingMu.Lock()
+	defer proxy.forwardingMu.Unlock()
 	proxy.mu.Lock()
 	proxy.queues = make(map[*session.Session]*packetQueue)
 	proxy.queuedBytes = 0
 	if proxy.startupGeneration == generation {
 		proxy.startupRunning = false
+		proxy.backendRunning = false
 		if permanent {
 			proxy.startupBlockedUntil = time.Now().Add(proxy.options.StartupFailureCooldown)
 		}
@@ -395,6 +452,11 @@ func (proxy *Proxy) ensureRunning() error {
 						timer.Stop()
 						return ctx.Err()
 					case <-timer.C:
+					}
+				}
+				if proxy.options.Readiness != nil {
+					if err := proxy.options.Readiness.Probe(ctx); err != nil {
+						return fmt.Errorf("recheck Palworld application readiness after settle: %w", err)
 					}
 				}
 				proxy.openStartupGate()
@@ -435,13 +497,22 @@ func (proxy *Proxy) ensureRunning() error {
 }
 
 func (proxy *Proxy) markBackendNotRunning() {
+	proxy.forwardingMu.Lock()
+	defer proxy.forwardingMu.Unlock()
 	proxy.mu.Lock()
 	proxy.backendRunning = false
-	proxy.backendReady = false
+	if proxy.backendReady {
+		proxy.backendReady = false
+		proxy.readinessGeneration++
+	}
 	proxy.mu.Unlock()
 }
 
 func (proxy *Proxy) openStartupGate() {
+	proxy.admissionMu.Lock()
+	defer proxy.admissionMu.Unlock()
+	proxy.forwardingMu.Lock()
+	defer proxy.forwardingMu.Unlock()
 	proxy.mu.Lock()
 	if proxy.shuttingDown {
 		proxy.mu.Unlock()
@@ -462,7 +533,10 @@ func (proxy *Proxy) openStartupGate() {
 	}
 	proxy.queues = make(map[*session.Session]*packetQueue)
 	proxy.queuedBytes = 0
-	proxy.backendReady = true
+	if !proxy.backendReady {
+		proxy.backendReady = true
+		proxy.readinessGeneration++
+	}
 	proxy.mu.Unlock()
 
 	activeSessions := proxy.store.Len()
@@ -487,6 +561,88 @@ func (proxy *Proxy) refreshPendingSessions() {
 	for _, active := range pending {
 		_ = active.RecordActivity()
 	}
+}
+
+func (proxy *Proxy) runBackendHealthMonitor() {
+	defer proxy.wg.Done()
+	ticker := time.NewTicker(proxy.options.StartupPollInterval)
+	defer ticker.Stop()
+	failures := backendHealthFailures{}
+	for {
+		select {
+		case <-proxy.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		proxy.mu.Lock()
+		ready := proxy.backendReady
+		generation := proxy.readinessGeneration
+		proxy.mu.Unlock()
+		if !ready {
+			failures.reset()
+			continue
+		}
+
+		probeCtx, cancel := context.WithTimeout(proxy.ctx, proxy.options.StartupPollInterval)
+		err := proxy.options.Readiness.Probe(probeCtx)
+		cancel()
+		if proxy.ctx.Err() != nil {
+			return
+		}
+		proxy.mu.Lock()
+		generationCurrent := proxy.backendReady && proxy.readinessGeneration == generation
+		proxy.mu.Unlock()
+		if !generationCurrent {
+			failures.reset()
+			continue
+		}
+		if err == nil {
+			failures.reset()
+			continue
+		}
+		failureClass := backendHealthFailureClass(err)
+		failureCount := failures.record(generation)
+		if failureCount < backendHealthFailureThreshold {
+			logrus.WithFields(logrus.Fields{
+				"failure_class": failureClass,
+				"failure_count": failureCount,
+			}).Warn("Palworld backend health probe failed; waiting for confirmation")
+			continue
+		}
+		failures.reset()
+		proxy.closeBackendGate(generation, failureClass)
+	}
+}
+
+func (proxy *Proxy) closeBackendGate(generation uint64, failureClass string) {
+	proxy.admissionMu.Lock()
+	defer proxy.admissionMu.Unlock()
+	proxy.forwardingMu.Lock()
+	defer proxy.forwardingMu.Unlock()
+
+	proxy.mu.Lock()
+	if !proxy.backendReady || proxy.readinessGeneration != generation {
+		proxy.mu.Unlock()
+		return
+	}
+	proxy.backendReady = false
+	proxy.backendRunning = false
+	proxy.readinessGeneration++
+	proxy.stopGeneration++
+	proxy.stopAutoStopTimerLocked()
+	proxy.queues = make(map[*session.Session]*packetQueue)
+	proxy.queuedBytes = 0
+	proxy.mu.Unlock()
+
+	activeSessions := proxy.store.Len()
+	if err := proxy.store.CloseAll(); err != nil {
+		logrus.WithError(err).Warn("Could not close every UDP session after backend readiness was lost")
+	}
+	logrus.WithFields(logrus.Fields{
+		"active_sessions": activeSessions,
+		"failure_class":   failureClass,
+	}).Warn("Palworld backend readiness lost; UDP forwarding gated")
 }
 
 func (proxy *Proxy) runSweeper(ctx context.Context) {
@@ -630,9 +786,14 @@ func (proxy *Proxy) runAutoStopAttempt(generation uint64, attempt int) {
 func (proxy *Proxy) shutdown() {
 	proxy.admissionMu.Lock()
 	defer proxy.admissionMu.Unlock()
+	proxy.forwardingMu.Lock()
+	defer proxy.forwardingMu.Unlock()
 	proxy.mu.Lock()
 	proxy.shuttingDown = true
-	proxy.backendReady = false
+	if proxy.backendReady {
+		proxy.backendReady = false
+		proxy.readinessGeneration++
+	}
 	proxy.backendRunning = false
 	proxy.startupRunning = false
 	proxy.startupGeneration++
