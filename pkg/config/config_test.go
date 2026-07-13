@@ -30,6 +30,15 @@ func TestValidateRejectsPacketSizeAboveUDPMaximum(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsPterodactylReadinessWithoutA2SAddress(t *testing.T) {
+	cfg := validConfig()
+	cfg.BackendReadinessMode = "pterodactyl"
+	cfg.BackendReadinessAddr = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() rejected Pterodactyl readiness: %v", err)
+	}
+}
+
 func TestValidateRejectsInvalidRequiredConfiguration(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -110,7 +119,7 @@ func TestDefaultConfigHasBoundedStartupAndSignaturePolicy(t *testing.T) {
 	if cfg.HealthAddr != "127.0.0.1:8080" {
 		t.Fatalf("unexpected health address: %q", cfg.HealthAddr)
 	}
-	if cfg.BackendReadinessMode != "a2s" || cfg.BackendReadinessAddr != "" {
+	if cfg.BackendReadinessMode != "pterodactyl" || cfg.BackendReadinessAddr != "" {
 		t.Fatalf("unexpected backend readiness defaults: mode=%q address=%q", cfg.BackendReadinessMode, cfg.BackendReadinessAddr)
 	}
 }
