@@ -136,10 +136,13 @@ func (cfg Config) Validate() error {
 	if healthAddr.IP == nil || !healthAddr.IP.IsLoopback() {
 		return fmt.Errorf("health_addr must use a loopback address")
 	}
-	if cfg.BackendReadinessMode != "a2s" && cfg.BackendReadinessMode != "delay" {
-		return fmt.Errorf("backend_readiness_mode must be a2s or delay")
+	if cfg.BackendReadinessMode != "pterodactyl" && cfg.BackendReadinessMode != "a2s" && cfg.BackendReadinessMode != "delay" {
+		return fmt.Errorf("backend_readiness_mode must be pterodactyl, a2s, or delay")
 	}
 	if cfg.BackendReadinessAddr != "" {
+		if cfg.BackendReadinessMode != "a2s" {
+			return fmt.Errorf("backend_readiness_addr is only valid in a2s mode")
+		}
 		readinessAddr, err := net.ResolveUDPAddr("udp", cfg.BackendReadinessAddr)
 		if err != nil {
 			return fmt.Errorf("invalid backend_readiness_addr: %w", err)
@@ -193,7 +196,7 @@ func DefaultConfig() Config {
 		LogUnmatchedPrefixes:         false,
 		DiagnosticPrefixBytes:        8,
 		HealthAddr:                   "127.0.0.1:8080",
-		BackendReadinessMode:         "a2s",
+		BackendReadinessMode:         "pterodactyl",
 		BackendReadinessAddr:         "",
 		Pterodactyl: PterodactylConfig{
 			BaseURL:  "",
