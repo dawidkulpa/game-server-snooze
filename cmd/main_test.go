@@ -14,9 +14,11 @@ import (
 
 type readinessController struct{ state server.State }
 
-func (controller readinessController) Status(context.Context) (server.State, error) { return controller.state, nil }
-func (readinessController) Start(context.Context) error                         { return nil }
-func (readinessController) Stop(context.Context) error                          { return nil }
+func (controller readinessController) Status(context.Context) (server.State, error) {
+	return controller.state, nil
+}
+func (readinessController) Start(context.Context) error { return nil }
+func (readinessController) Stop(context.Context) error { return nil }
 
 func TestNewPalworldDetectorUsesConfiguredWakePolicy(t *testing.T) {
 	cfg := config.DefaultConfig()
