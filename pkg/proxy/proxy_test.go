@@ -453,7 +453,17 @@ func TestBackendHealthLossRequiresWakeSignatureBeforeRecovery(t *testing.T) {
 	instance.wg.Wait()
 }
 
-func TestEnsureRunningRechecksReadinessAfterSettleDelay(t *testing.T) {
+func TestFailedPostSettleProbeRequiresWakeSignatureForRetry(t *testing.T) {
+	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	public, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer public.Close()
 	store, err := session.NewStore(1)
 	if err != nil {
 		t.Fatal(err)
@@ -462,29 +472,69 @@ func TestEnsureRunningRechecksReadinessAfterSettleDelay(t *testing.T) {
 		results:     []error{errors.New("backend left running during settle")},
 		probeCalled: make(chan struct{}, 1),
 	}
+	controller := newFakeController(server.StateRunning)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	instance := &Proxy{
-		ctx:    ctx,
-		store:  store,
-		queues: make(map[*session.Session]*packetQueue),
+		ctx:               ctx,
+		store:             store,
+		queues:            make(map[*session.Session]*packetQueue),
+		startupGeneration: 1,
 		options: Options{
-			Controller:          newFakeController(server.StateRunning),
-			Readiness:           probe,
-			StartupTimeout:      time.Second,
-			StartupPollInterval: time.Millisecond,
-			StartupSettleDelay:  time.Millisecond,
+			Listener:                     public,
+			BackendAddr:                  backend.LocalAddr().(*net.UDPAddr),
+			Controller:                   controller,
+			Detector:                     testWakeDetector{},
+			Readiness:                    probe,
+			MaxPacketSize:                1024,
+			StartupTimeout:               time.Second,
+			StartupPollInterval:          time.Millisecond,
+			StartupSettleDelay:           time.Millisecond,
+			StartupBufferPackets:         4,
+			StartupBufferBytesPerSession: 4096,
+			StartupBufferBytesGlobal:     8192,
 		},
 	}
-	if err := instance.ensureRunning(); err == nil {
+	startupErr := instance.ensureRunning()
+	if startupErr == nil {
 		t.Fatal("ensureRunning() opened the gate after readiness was lost during settle")
 	}
+	instance.failStartup(1, false)
 	instance.mu.Lock()
 	ready := instance.backendReady
+	running := instance.backendRunning
 	instance.mu.Unlock()
 	if ready {
 		t.Fatal("backend gate opened after final readiness probe failed")
 	}
+	if running {
+		t.Fatal("failed final readiness probe left stale running state")
+	}
+
+	controller.mu.Lock()
+	controller.state = server.StateOffline
+	controller.mu.Unlock()
+	clientAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 23457}
+	instance.handleClientPacket(clientAddr, []byte("unsigned"))
+	if store.Len() != 0 {
+		t.Fatal("unsigned packet created a session after failed final readiness probe")
+	}
+	controller.mu.Lock()
+	startCalls := controller.startCalls
+	controller.mu.Unlock()
+	if startCalls != 0 {
+		t.Fatal("unsigned packet restarted backend after failed final readiness probe")
+	}
+
+	instance.handleClientPacket(clientAddr, []byte("wake"))
+	select {
+	case <-controller.startCh:
+	case <-time.After(time.Second):
+		t.Fatal("signed wake packet did not request backend restart")
+	}
+	cancel()
+	_ = store.CloseAll()
+	instance.wg.Wait()
 }
 
 func TestBackendHealthMonitorKeepsGateOpenAfterTransientFailure(t *testing.T) {
