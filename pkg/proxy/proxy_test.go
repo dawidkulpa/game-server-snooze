@@ -1421,8 +1421,19 @@ func TestReadinessFailureClosesPendingSessionsAndReleasesBuffers(t *testing.T) {
 	}
 	select {
 	case <-readiness.entered:
+		t.Fatal("unsigned packet restarted readiness after startup failure")
+	case <-time.After(25 * time.Millisecond):
+	}
+	if instance.store.Len() != 0 {
+		t.Fatal("unsigned packet created a session after startup failure")
+	}
+	if _, err := client.Write([]byte("wake")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-readiness.entered:
 	case <-time.After(time.Second):
-		t.Fatal("a packet after startup failure did not start a fresh readiness attempt")
+		t.Fatal("signed wake packet after startup failure did not start a fresh readiness attempt")
 	}
 	cancel()
 	select {
