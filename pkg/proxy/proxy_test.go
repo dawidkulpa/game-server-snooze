@@ -499,7 +499,24 @@ func TestFailedPostSettleProbeRequiresWakeSignatureForRetry(t *testing.T) {
 	if startupErr == nil {
 		t.Fatal("ensureRunning() opened the gate after readiness was lost during settle")
 	}
-	instance.failStartup(1, false)
+	instance.forwardingMu.RLock()
+	failureDone := make(chan struct{})
+	go func() {
+		instance.failStartup(1, false)
+		close(failureDone)
+	}()
+	select {
+	case <-failureDone:
+		instance.forwardingMu.RUnlock()
+		t.Fatal("startup failure cleanup bypassed active packet forwarding")
+	case <-time.After(25 * time.Millisecond):
+	}
+	instance.forwardingMu.RUnlock()
+	select {
+	case <-failureDone:
+	case <-time.After(time.Second):
+		t.Fatal("startup failure cleanup did not finish after forwarding drained")
+	}
 	instance.mu.Lock()
 	ready := instance.backendReady
 	running := instance.backendRunning
