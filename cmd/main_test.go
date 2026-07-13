@@ -18,7 +18,7 @@ func (controller readinessController) Status(context.Context) (server.State, err
 	return controller.state, nil
 }
 func (readinessController) Start(context.Context) error { return nil }
-func (readinessController) Stop(context.Context) error { return nil }
+func (readinessController) Stop(context.Context) error  { return nil }
 
 func TestNewPalworldDetectorUsesConfiguredWakePolicy(t *testing.T) {
 	cfg := config.DefaultConfig()

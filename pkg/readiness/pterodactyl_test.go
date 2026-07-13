@@ -87,4 +87,5 @@ func TestPterodactylProbePropagatesPermanentStatusError(t *testing.T) {
 }
 
 type permanentStatusError struct{ error }
+
 func (permanentStatusError) Permanent() bool { return true }
