@@ -274,7 +274,10 @@ func (proxy *Proxy) handleClientPacket(clientAddr *net.UDPAddr, packet []byte) {
 		return
 	}
 	if created {
-		logrus.WithField("active_sessions", activeCount).Info("UDP session opened")
+		logrus.WithFields(logrus.Fields{
+			"active_sessions": activeCount,
+			"client_ip":       clientAddr.IP.String(),
+		}).Info("UDP session opened")
 		proxy.cancelAutoStop()
 		proxy.watchSession(key, createdSession)
 	}
