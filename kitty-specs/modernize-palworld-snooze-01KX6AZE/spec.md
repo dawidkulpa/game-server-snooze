@@ -6,7 +6,7 @@ Target release: `0.5.0`
 
 ## 1. Purpose
 
-Modernize `game-server-snooze` so current Palworld clients can connect through a UDP proxy that starts a Pterodactyl-managed game server on demand and stops it only after all observed player traffic has ended. The proxy must not accumulate sockets or goroutines across reconnects, must tolerate slow game-server startup, and must fail visibly rather than silently stopping an active server.
+Modernize `game-server-snooze` so current Palworld clients can connect through a UDP proxy that starts a Pterodactyl-managed game server on demand and stops it only after all observed player traffic has ended. The proxy must not accumulate sockets or goroutines across reconnects, must tolerate slow game-server startup, must keep an established UDP data plane available during inconclusive Pterodactyl control-plane failures, and must fail visibly rather than silently stopping an active server.
 
 ## 2. Deployment context
 
@@ -25,6 +25,8 @@ Modernize `game-server-snooze` so current Palworld clients can connect through a
 - **Wake packet:** a new-flow packet accepted by the configured game detector while the backend is stopped.
 - **Startup gate:** the period after a wake packet is accepted and before buffered packets may be sent to the backend.
 - **Zero-session generation:** an identity associated with one transition to zero active sessions; it prevents stale timers from stopping a newly active server.
+- **Inconclusive readiness failure:** a timeout, transport failure, HTTP error, authorization failure, malformed response, or canceled request that prevents the proxy from learning the current Pterodactyl state. It is not evidence that the already-forwarding gameplay backend stopped.
+- **Confirmed backend unavailability:** a successful Pterodactyl status response whose recognized state is `offline`, `starting`, or `stopping`.
 
 ## 4. Functional requirements
 
@@ -60,7 +62,10 @@ Modernize `game-server-snooze` so current Palworld clients can connect through a
 | FR-028 | The private deployment Compose MUST retain its existing UDP `8212:8212`, `LISTEN_ADDR=:8212`, private gameplay backend, and environment-token mechanism, while updating `PTERO_SERVER_ID` to the deployment-provided replacement value. |
 | FR-029 | The deployment MUST pin a candidate/versioned image tag rather than `latest`; production replicas MUST change from zero to one only for the live validation/deployment stage. |
 | FR-030 | The implementation MUST provide a controlled current-client validation sequence: stopped backend → connect attempt → one start request → readiness → successful join → disconnect/idle expiry → delayed stop. The agent MUST explicitly tell the user when to initiate the connection. |
-| FR-031 | Normal operation MUST emit structured info-level lifecycle logs for UDP session creation/removal, backend readiness, auto-stop scheduling/cancellation, and successful stop requests. Logs MUST include bounded operational fields such as active-session counts, expiry counts, delays, and attempts without exposing client IP addresses, backend addresses, credentials, or Pterodactyl identifiers. UDP sessions MUST NOT be described as authenticated players. |
+| FR-031 | Normal operation MUST emit structured info-level lifecycle logs for UDP session creation/removal, backend readiness, auto-stop scheduling/cancellation, and successful stop requests. Logs MUST include bounded operational fields such as active-session counts, expiry counts, delays, and attempts without exposing backend addresses, credentials, Pterodactyl identifiers, client source ports, or packet bodies. UDP sessions MUST NOT be described as authenticated players. |
+| FR-032 | Every successfully created UDP session MUST log the normalized source IP in a structured `client_ip` field. This is operator-requested connection attribution and MUST work for IPv4 and IPv6 without including the ephemeral source port. |
+| FR-033 | While established UDP forwarding is open in `pterodactyl` readiness mode, an inconclusive readiness failure MUST be logged but MUST NOT close the forwarding gate, clear running state, or close existing sessions. Startup and recovery attempts remain fail-closed and MUST NOT infer `running` from an inconclusive failure. |
+| FR-034 | Established forwarding in `pterodactyl` mode MAY be gated only after three consecutive confirmed backend-unavailability responses in the same readiness generation. A successful `running` response or any inconclusive result MUST reset the confirmation sequence. Legacy A2S mode retains its protocol-specific timeout behavior. |
 
 ## 5. Non-functional requirements
 
@@ -71,7 +76,7 @@ Modernize `game-server-snooze` so current Palworld clients can connect through a
 | NFR-003 | Integration tests MUST use real localhost UDP sockets and an `httptest` Pterodactyl API, not a real production server. |
 | NFR-004 | Tests MUST cover repeated connect/expire cycles and prove goroutine/socket counts do not grow without bound. Exact runtime goroutine counts may use a bounded tolerance. |
 | NFR-005 | Startup buffering, maximum sessions, packet size, and diagnostic logging MUST remain bounded under hostile input. |
-| NFR-006 | Logging MUST identify lifecycle state transitions, bounded flow counts, and stop/start outcomes sufficiently for diagnosis without emitting client IP addresses, private backend/controller values, credentials, or unlimited packet bodies. |
+| NFR-006 | Logging MUST identify lifecycle state transitions, bounded flow counts, client source IPs on session creation, and stop/start outcomes sufficiently for diagnosis without emitting client source ports, private backend/controller values, credentials, or unlimited packet bodies. |
 | NFR-007 | The implementation MUST remain a lightweight single-process proxy with no database, durable state store, or external queue. |
 | NFR-008 | Public documentation and examples MUST use generic placeholders and MUST NOT contain private hostnames, tokens, or the production server identifier. The production identifier belongs only in the private Compose repository. |
 | NFR-009 | Changes MUST receive independent spec-compliance and security/concurrency review of an immutable staged diff before commit. |
@@ -89,7 +94,9 @@ Modernize `game-server-snooze` so current Palworld clients can connect through a
 
 ## 7. Failure behavior
 
-- Pterodactyl unavailable: keep the proxy alive, emit a bounded actionable error, keep startup sessions bounded, and allow a later client retry to initiate another bounded attempt.
+- Pterodactyl unavailable during startup/recovery: keep the proxy alive, emit a bounded actionable error, keep startup sessions bounded, and allow a later signed client retry to initiate another bounded attempt.
+- Pterodactyl unavailable while gameplay forwarding is already established: keep forwarding and existing sessions intact, log the inconclusive control-plane failure, and resume state confirmation when the API recovers.
+- Pterodactyl successfully reports `offline`, `starting`, or `stopping` three consecutive times while gameplay forwarding is established: close the forwarding gate and sessions using the existing generation-safe loss path.
 - Start accepted but server never reaches `running`: expire the startup operation after a configured timeout, close affected startup sessions, and do not claim readiness.
 - Startup buffer full: retain deterministic bounded behavior, log a rate-limited warning, and never allocate beyond limits.
 - Backend UDP read/write error: remove and close only the affected session; re-evaluate zero-session auto-stop safely.
@@ -102,6 +109,7 @@ Modernize `game-server-snooze` so current Palworld clients can connect through a
 - Managing edge-gateway port-forwarding or firewall rules.
 - Replacing Pterodactyl.
 - Parsing player identities or querying Palworld REST/RCON for authoritative player counts.
+- Preserving original client source addresses inside Palworld itself; the UDP proxy remains the backend peer and connection attribution is provided by proxy logs.
 - Automatically changing cron/schedule intervals.
 - Deploying or mutating production before a reviewed candidate image exists.
 
@@ -142,6 +150,18 @@ Given the reviewed candidate proxy is deployed and the Palworld server is stoppe
 ### AS-009: Startup exceeds idle timeout
 
 Given a valid flow is accepted and startup takes longer than `IDLE_TIMEOUT` but less than `STARTUP_TIMEOUT`, the bounded pending session and its initial packets remain available, become active when readiness succeeds, and are not expired by the normal idle sweeper during startup.
+
+### AS-010: Pterodactyl control-plane timeout during active play
+
+Given six active UDP sessions and a backend previously confirmed `running`, when three or more Pterodactyl status calls time out, the proxy logs bounded inconclusive failures, retains all six sessions, and continues forwarding without a reconnect. A later successful `running` response clears the warning sequence.
+
+### AS-011: Confirmed backend stop during active forwarding
+
+Given active forwarding, when Pterodactyl successfully reports a recognized non-running state three consecutive times in the same readiness generation, the proxy closes the forwarding gate and all affected sessions. A `running` response or an inconclusive control-plane result between confirmations prevents the sequence from completing.
+
+### AS-012: Connection attribution
+
+Given a new IPv4 or IPv6 UDP flow is accepted, the session-open log contains exactly the normalized source IP in `client_ip` and does not contain the source port, backend address, credentials, identifiers, or packet contents.
 
 ## 10. Completion gate
 
