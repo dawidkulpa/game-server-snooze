@@ -74,6 +74,23 @@ func TestPterodactylProbeWaitsForRunningState(t *testing.T) {
 	}
 }
 
+func TestPterodactylProbeMarksStatusFailuresAsInconclusive(t *testing.T) {
+	want := errors.New("status transport failed")
+	controller := &stateController{err: want}
+	probe, err := NewPterodactylProbe(controller, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeErr := probe.Probe(context.Background())
+	if !errors.Is(probeErr, want) {
+		t.Fatalf("Probe() error = %v, want wrapped status failure", probeErr)
+	}
+	var inconclusive interface{ ReadinessInconclusive() bool }
+	if !errors.As(probeErr, &inconclusive) || !inconclusive.ReadinessInconclusive() {
+		t.Fatalf("Probe() status error is not marked inconclusive: %v", probeErr)
+	}
+}
+
 func TestPterodactylProbePropagatesPermanentStatusError(t *testing.T) {
 	want := errors.New("status failed")
 	controller := &stateController{err: permanentStatusError{want}}
