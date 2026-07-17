@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"dkulpa.eu/game-server-snooze/pkg/config"
+	"dkulpa.eu/game-server-snooze/pkg/readiness"
 	"dkulpa.eu/game-server-snooze/pkg/server"
 	"dkulpa.eu/game-server-snooze/pkg/session"
 	"github.com/sirupsen/logrus"
@@ -590,6 +591,93 @@ func TestBackendHealthMonitorKeepsGateOpenAfterTransientFailure(t *testing.T) {
 		t.Fatal("backend readiness gate closed after a single transient failure")
 	}
 	cancel()
+	instance.wg.Wait()
+}
+
+func TestBackendHealthMonitorKeepsEstablishedSessionsOpenAfterInconclusivePterodactylFailures(t *testing.T) {
+	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	public, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer public.Close()
+	store, err := session.NewStore(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := newFakeController(server.StateRunning)
+	controller.statusResults = []error{
+		context.DeadlineExceeded,
+		context.DeadlineExceeded,
+		context.DeadlineExceeded,
+	}
+	probe, err := readiness.NewPterodactylProbe(controller, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	instance := &Proxy{
+		ctx:                 ctx,
+		store:               store,
+		backendReady:        true,
+		backendRunning:      true,
+		readinessGeneration: 1,
+		queues:              make(map[*session.Session]*packetQueue),
+		options: Options{
+			Listener:            public,
+			BackendAddr:         backend.LocalAddr().(*net.UDPAddr),
+			Controller:          controller,
+			Detector:            testWakeDetector{},
+			Readiness:           probe,
+			MaxPacketSize:       1024,
+			StartupPollInterval: time.Millisecond,
+		},
+	}
+	clientAddr := &net.UDPAddr{IP: net.ParseIP("198.51.100.42"), Port: 23456}
+	instance.handleClientPacket(clientAddr, []byte("active-gameplay"))
+	active, ok := store.Get(clientAddr.String())
+	if !ok {
+		t.Fatal("active session was not created")
+	}
+
+	instance.wg.Add(1)
+	go instance.runBackendHealthMonitor()
+	deadline := time.Now().Add(time.Second)
+	for {
+		controller.mu.Lock()
+		calls := controller.statusCalls
+		controller.mu.Unlock()
+		if calls >= 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backend health monitor did not probe after the inconclusive failures")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	instance.mu.Lock()
+	ready := instance.backendReady
+	running := instance.backendRunning
+	instance.mu.Unlock()
+	if !ready || !running {
+		t.Fatalf("inconclusive Pterodactyl failures changed established state: ready=%t running=%t", ready, running)
+	}
+	if got, ok := store.Get(clientAddr.String()); !ok || got != active {
+		t.Fatal("inconclusive Pterodactyl failures replaced or closed the established session")
+	}
+	select {
+	case <-active.Done():
+		t.Fatal("inconclusive Pterodactyl failures closed the established session")
+	default:
+	}
+
+	cancel()
+	_ = store.CloseAll()
 	instance.wg.Wait()
 }
 
