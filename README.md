@@ -16,7 +16,7 @@ The proxy uses observed UDP traffic, not player identities or Palworld REST/RCON
 
 ### Operational lifecycle logs
 
-At the default `info` level, the proxy logs UDP session creation/removal, idle-expiry counts, backend readiness, auto-stop scheduling/cancellation, and start/stop request outcomes. A UDP session is an observed source flow, not an authenticated Palworld player. Lifecycle entries use bounded counters, delays, and attempts; they do not include client IP addresses, private backend/controller addresses, credentials, or Pterodactyl identifiers.
+At the default `info` level, the proxy logs UDP session creation/removal, idle-expiry counts, backend readiness, auto-stop scheduling/cancellation, and start/stop request outcomes. Every successful session-open entry includes the normalized source IP as `client_ip`, without the ephemeral source port. A UDP session is an observed source flow, not an authenticated Palworld player. Other lifecycle entries use bounded counters, delays, and attempts and do not include private backend/controller addresses, credentials, Pterodactyl identifiers, or packet bodies. Operators should treat retained logs as containing client network identifiers.
 
 ## Configuration
 
@@ -55,7 +55,7 @@ Configuration is read from `config.yaml` in the process working directory. Envir
 
 The default `pterodactyl` mode opens the startup gate only after the panel reports `running`, then applies `STARTUP_SETTLE_DELAY`. The native Palworld 1.0 egg is responsible for the application-level half of this contract: it emits `PALWORLD_READY` only when authenticated private REST `/v1/api/info` succeeds and a marked game process owns a UDP listener on the gameplay port. Wings does not report the server as running before that marker.
 
-The proxy continues polling panel state after startup and closes the forwarding gate if the launcher/container leaves `running`. `a2s` remains only as an explicit compatibility mode for other server builds that actually expose Steam A2S. `delay` is a weaker compatibility mode with no ongoing readiness probe.
+The proxy continues polling panel state after startup. A timeout, transport/API error, authorization failure, or malformed response is inconclusive about an already-established gameplay data plane: it is logged, but forwarding and existing sessions remain open. Three consecutive successful recognized non-running responses (`offline`, `starting`, or `stopping`) in the same readiness generation confirm backend loss and close the forwarding gate. A successful `running` response or an inconclusive result resets that confirmation sequence. Startup and recovery remain fail-closed. `a2s` retains its protocol-specific timeout behavior and remains only as an explicit compatibility mode for server builds that actually expose Steam A2S. `delay` is a weaker compatibility mode with no ongoing readiness probe.
 
 ### Wake compatibility
 
