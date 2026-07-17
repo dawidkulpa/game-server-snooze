@@ -15,7 +15,7 @@ import (
 	logrustest "github.com/sirupsen/logrus/hooks/test"
 )
 
-func TestSessionLifecycleEmitsPrivacySafeOperationalLogs(t *testing.T) {
+func TestSessionLifecycleEmitsOperationalLogsWithNormalizedClientIPs(t *testing.T) {
 	hook := logrustest.NewGlobal()
 	defer hook.Reset()
 
@@ -57,7 +57,7 @@ func TestSessionLifecycleEmitsPrivacySafeOperationalLogs(t *testing.T) {
 	}
 	instance.wg.Wait()
 
-	secondClient := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 54322}
+	secondClient := &net.UDPAddr{IP: net.ParseIP("2001:db8::9"), Port: 54322}
 	instance.mu.Lock()
 	instance.backendReady = true
 	instance.mu.Unlock()
@@ -72,11 +72,10 @@ func TestSessionLifecycleEmitsPrivacySafeOperationalLogs(t *testing.T) {
 	assertLogEntry(t, entries, "UDP session opened", map[string]any{"active_sessions": 1})
 	assertLogEntry(t, entries, "UDP session closed", map[string]any{"active_sessions": 0})
 	assertLogEntry(t, entries, "Idle UDP sessions expired", map[string]any{"expired_sessions": 1, "active_sessions": 0})
+	assertSessionOpenClientIPs(t, entries, []string{"198.51.100.42", "2001:db8::9"})
 	sensitiveValues := []string{
-		clientAddr.IP.String(),
 		fmt.Sprint(clientAddr.Port),
 		clientAddr.String(),
-		secondClient.IP.String(),
 		fmt.Sprint(secondClient.Port),
 		secondClient.String(),
 		backend.LocalAddr().String(),
@@ -99,6 +98,24 @@ func TestSessionLifecycleEmitsPrivacySafeOperationalLogs(t *testing.T) {
 					t.Fatalf("log field exposed sensitive runtime data in %q", entry.Message)
 				}
 			}
+		}
+	}
+}
+
+func assertSessionOpenClientIPs(t *testing.T, entries []*logrus.Entry, want []string) {
+	t.Helper()
+	var got []string
+	for _, entry := range entries {
+		if entry.Message == "UDP session opened" {
+			got = append(got, valueToString(entry.Data["client_ip"]))
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("session-open client_ip count = %d (%v), want %d (%v)", len(got), got, len(want), want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("session-open client_ip[%d] = %q, want %q", index, got[index], want[index])
 		}
 	}
 }

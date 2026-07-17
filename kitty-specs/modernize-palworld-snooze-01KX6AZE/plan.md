@@ -7,6 +7,8 @@
 
 Refactor the global-state UDP proxy into injected, testable components with explicit session ownership and a synchronized server lifecycle. A bounded startup gate will single-flight Pterodactyl startup, retain accepted handshake retries until the backend is ready, and release them after a configurable settle delay. Auto-stop will use generation-checked timers so stale callbacks cannot stop an active server. Palworld wake signatures will be configurable and safely diagnosable, while a running backend may adopt traffic after proxy restart. CI will enforce race, vet, build, container, and Docker Hub publication gates. The private deployment remains on proxy UDP 8212 and the existing environment-token mechanism.
 
+The 2026-07-16 production follow-up adds two corrective slices: structured source-IP attribution on every accepted UDP session, and control-plane/data-plane isolation so Pterodactyl API timeouts cannot evict active gameplay sessions. Only three consecutive successful non-running state responses may confirm backend loss in Pterodactyl mode; inconclusive errors reset that confirmation sequence while startup remains fail-closed.
+
 ## Technical Context
 
 **Language/Version**: Go 1.26.5; module currently declares Go 1.23.5 and will be upgraded deliberately.
@@ -60,6 +62,10 @@ Removing a session first detaches it from the store under the proxy mutex and th
 ### Server lifecycle
 
 The proxy maintains explicit backend states: `unknown`, `offline`, `starting`, `running`, `stopping`. The Pterodactyl client remains stateless and performs bounded requests. It classifies non-retryable `4xx` authorization/configuration failures and malformed/unknown status payloads as permanent. No power request follows a failed status query; transient failures are polled within the startup deadline until a successful `offline` response permits one start. The proxy single-flights startup and controls polling/settle timing. Startup success opens all pending session gates. Startup failure closes only pending sessions and leaves the listener available for later retries.
+
+Once forwarding is established, the gameplay UDP path is not made dependent on continuous reachability of the Pterodactyl HTTP control plane. The readiness probe distinguishes an inconclusive status failure from a successful recognized non-running state. Inconclusive failures are warning-only and reset the confirmation counter. Three consecutive confirmed non-running responses within the same readiness generation close the gate through the existing admission/forwarding locks. A successful `running` response also resets confirmation. A2S keeps its existing data-plane-specific timeout semantics.
+
+Session-open lifecycle logs include a normalized `client_ip` field copied from the accepted UDP source address, excluding the ephemeral source port. This intentionally changes the earlier privacy posture at the operator's request while retaining credential, backend, identifier, and packet-body redaction.
 
 Auto-stop captures the current zero-session generation. Its callback acquires the admission mutex, verifies the generation and zero active sessions, and keeps new-session admission blocked for the bounded Pterodactyl `stop` request. The ordinary state mutex is not held during HTTP. A waiting session add proceeds only after the stop result is known, increments the generation, and cancels any retry timer; this is the linearization point tested with a barrier-controlled stop/add race.
 
@@ -196,6 +202,14 @@ docker-compose.yml
 - **Sequencing/depends-on**: all implementation concerns.
 - **Risks**: publishing from untrusted PRs, overwriting stable tags, leaking private deployment data, changing replicas before candidate exists.
 
+### IC-09 — Client attribution and control-plane resilience
+
+- **Purpose**: Attribute accepted UDP flows by source IP and prevent an inconclusive Pterodactyl API outage from disconnecting healthy active gameplay.
+- **Relevant requirements**: FR-031–FR-034; NFR-006, NFR-009.
+- **Affected surfaces**: `pkg/proxy`, `pkg/readiness`, lifecycle tests, README, specification and plan.
+- **Sequencing/depends-on**: IC-03, IC-04, IC-07.
+- **Risks**: logging source ports or private data, treating an API error as backend state, retaining forwarding after an actual backend crash until an authoritative state response returns, changing legacy A2S behavior unintentionally.
+
 ## Delivery phases
 
 1. Commit substantive specification and plan artifacts.
@@ -212,6 +226,7 @@ docker-compose.yml
 12. After user merge/deployment confirmation, verify Pterodactyl authorization while read-only.
 13. Tell the user to connect only when the proxy is healthy and Palworld is confirmed stopped; observe the full live acceptance flow.
 14. If the current handshake differs, update signature fixture/default through spec-first TDD, re-review, publish a new candidate, and repeat the controlled live test.
+15. Follow-up: reproduce the 2026-07-16 timeout-driven disconnect, add RED source-IP and inconclusive-control-plane tests, implement the minimum classification/monitor changes, run all local/CI gates, obtain immutable review, and publish a new no-prefix candidate only after merge.
 
 ## Verification gates
 
@@ -237,6 +252,10 @@ docker-compose.yml
 - Production binary and both target container architectures build.
 - Staged diff digest receives matching independent approval.
 - Candidate image digest recorded.
+- Session-open logs prove IPv4/IPv6 `client_ip` attribution without source ports.
+- Repeated inconclusive Pterodactyl failures keep established forwarding and sessions open; repeated confirmed non-running states still close them.
+- Deterministic real-`PterodactylProbe` sequences prove that both `running` and inconclusive results reset two prior non-running confirmations, and that only three subsequent consecutive recognized non-running responses close the gate and sessions.
+- The immutable candidate patch preserves its terminal newline and passes `git apply --numstat` from the recorded base before review dispatch.
 
 ### Live-validation gate
 

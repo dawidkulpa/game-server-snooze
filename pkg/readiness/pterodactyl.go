@@ -17,6 +17,15 @@ type PterodactylProbe struct {
 	pollInterval time.Duration
 }
 
+type inconclusiveReadinessError struct {
+	err error
+}
+
+func (err inconclusiveReadinessError) Error() string           { return err.err.Error() }
+func (err inconclusiveReadinessError) Unwrap() error           { return err.err }
+func (inconclusiveReadinessError) ReadinessInconclusive() bool { return true }
+func (err inconclusiveReadinessError) Permanent() bool         { return server.IsPermanent(err.err) }
+
 func NewPterodactylProbe(controller server.Controller, pollInterval time.Duration) (*PterodactylProbe, error) {
 	if controller == nil || pollInterval <= 0 {
 		return nil, fmt.Errorf("Pterodactyl controller and positive poll interval are required")
@@ -26,11 +35,11 @@ func NewPterodactylProbe(controller server.Controller, pollInterval time.Duratio
 
 func (probe *PterodactylProbe) Probe(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("probe Pterodactyl readiness: %w", err)
+		return inconclusiveReadinessError{err: fmt.Errorf("probe Pterodactyl readiness: %w", err)}
 	}
 	state, err := probe.controller.Status(ctx)
 	if err != nil {
-		return fmt.Errorf("probe Pterodactyl readiness: %w", err)
+		return inconclusiveReadinessError{err: fmt.Errorf("probe Pterodactyl readiness: %w", err)}
 	}
 	if state != server.StateRunning {
 		return fmt.Errorf("Pterodactyl backend state is %q, not running", state)

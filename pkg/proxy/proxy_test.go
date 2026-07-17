@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"dkulpa.eu/game-server-snooze/pkg/config"
+	"dkulpa.eu/game-server-snooze/pkg/readiness"
 	"dkulpa.eu/game-server-snooze/pkg/server"
 	"dkulpa.eu/game-server-snooze/pkg/session"
 	"github.com/sirupsen/logrus"
@@ -95,6 +96,44 @@ type blockingHealthReadiness struct {
 	release chan struct{}
 	next    chan struct{}
 }
+
+type sequencedStatusResult struct {
+	state server.State
+	err   error
+}
+
+type sequencedStatusController struct {
+	mu      sync.Mutex
+	results []sequencedStatusResult
+	called  chan struct{}
+	release chan struct{}
+}
+
+func (controller *sequencedStatusController) Status(ctx context.Context) (server.State, error) {
+	controller.mu.Lock()
+	if len(controller.results) == 0 {
+		controller.mu.Unlock()
+		return server.StateRunning, nil
+	}
+	result := controller.results[0]
+	controller.results = controller.results[1:]
+	controller.mu.Unlock()
+
+	select {
+	case controller.called <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	select {
+	case <-controller.release:
+		return result.state, result.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (*sequencedStatusController) Start(context.Context) error { return nil }
+func (*sequencedStatusController) Stop(context.Context) error  { return nil }
 
 func (probe *blockingHealthReadiness) WaitReady(context.Context) error { return nil }
 
@@ -591,6 +630,211 @@ func TestBackendHealthMonitorKeepsGateOpenAfterTransientFailure(t *testing.T) {
 	}
 	cancel()
 	instance.wg.Wait()
+}
+
+func TestBackendHealthMonitorKeepsEstablishedSessionsOpenAfterInconclusivePterodactylFailures(t *testing.T) {
+	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	public, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer public.Close()
+	store, err := session.NewStore(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := newFakeController(server.StateRunning)
+	controller.statusResults = []error{
+		context.DeadlineExceeded,
+		context.DeadlineExceeded,
+		context.DeadlineExceeded,
+	}
+	probe, err := readiness.NewPterodactylProbe(controller, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	instance := &Proxy{
+		ctx:                 ctx,
+		store:               store,
+		backendReady:        true,
+		backendRunning:      true,
+		readinessGeneration: 1,
+		queues:              make(map[*session.Session]*packetQueue),
+		options: Options{
+			Listener:            public,
+			BackendAddr:         backend.LocalAddr().(*net.UDPAddr),
+			Controller:          controller,
+			Detector:            testWakeDetector{},
+			Readiness:           probe,
+			MaxPacketSize:       1024,
+			StartupPollInterval: time.Millisecond,
+		},
+	}
+	clientAddr := &net.UDPAddr{IP: net.ParseIP("198.51.100.42"), Port: 23456}
+	instance.handleClientPacket(clientAddr, []byte("active-gameplay"))
+	active, ok := store.Get(clientAddr.String())
+	if !ok {
+		t.Fatal("active session was not created")
+	}
+
+	instance.wg.Add(1)
+	go instance.runBackendHealthMonitor()
+	deadline := time.Now().Add(time.Second)
+	for {
+		controller.mu.Lock()
+		calls := controller.statusCalls
+		controller.mu.Unlock()
+		if calls >= 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backend health monitor did not probe after the inconclusive failures")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	instance.mu.Lock()
+	ready := instance.backendReady
+	running := instance.backendRunning
+	instance.mu.Unlock()
+	if !ready || !running {
+		t.Fatalf("inconclusive Pterodactyl failures changed established state: ready=%t running=%t", ready, running)
+	}
+	if got, ok := store.Get(clientAddr.String()); !ok || got != active {
+		t.Fatal("inconclusive Pterodactyl failures replaced or closed the established session")
+	}
+	select {
+	case <-active.Done():
+		t.Fatal("inconclusive Pterodactyl failures closed the established session")
+	default:
+	}
+
+	cancel()
+	_ = store.CloseAll()
+	instance.wg.Wait()
+}
+
+func TestBackendHealthMonitorRequiresConsecutiveConfirmedPterodactylStates(t *testing.T) {
+	tests := []struct {
+		name      string
+		separator sequencedStatusResult
+	}{
+		{name: "running resets confirmation", separator: sequencedStatusResult{state: server.StateRunning}},
+		{name: "inconclusive resets confirmation", separator: sequencedStatusResult{err: context.DeadlineExceeded}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer backend.Close()
+			public, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer public.Close()
+			store, err := session.NewStore(2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			controller := &sequencedStatusController{
+				results: []sequencedStatusResult{
+					{state: server.StateOffline},
+					{state: server.StateStarting},
+					test.separator,
+					{state: server.StateStopping},
+					{state: server.StateOffline},
+					{state: server.StateStarting},
+				},
+				called:  make(chan struct{}),
+				release: make(chan struct{}),
+			}
+			probe, err := readiness.NewPterodactylProbe(controller, 100*time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			instance := &Proxy{
+				ctx:                 ctx,
+				store:               store,
+				backendReady:        true,
+				backendRunning:      true,
+				readinessGeneration: 1,
+				queues:              make(map[*session.Session]*packetQueue),
+				options: Options{
+					Listener:            public,
+					BackendAddr:         backend.LocalAddr().(*net.UDPAddr),
+					Controller:          controller,
+					Detector:            testWakeDetector{},
+					Readiness:           probe,
+					MaxPacketSize:       1024,
+					StartupPollInterval: 100 * time.Millisecond,
+				},
+			}
+			t.Cleanup(func() {
+				cancel()
+				_ = store.CloseAll()
+				instance.wg.Wait()
+			})
+			clientAddr := &net.UDPAddr{IP: net.ParseIP("198.51.100.42"), Port: 23456}
+			instance.handleClientPacket(clientAddr, []byte("active-gameplay"))
+			active, ok := store.Get(clientAddr.String())
+			if !ok {
+				t.Fatal("active session was not created")
+			}
+
+			instance.wg.Add(1)
+			go instance.runBackendHealthMonitor()
+			for call := 0; call < 6; call++ {
+				select {
+				case <-controller.called:
+				case <-time.After(time.Second):
+					t.Fatalf("status call %d did not start", call+1)
+				}
+				if call > 0 {
+					instance.mu.Lock()
+					ready := instance.backendReady
+					instance.mu.Unlock()
+					if !ready {
+						t.Fatalf("gate closed before the final consecutive confirmation at call %d", call+1)
+					}
+					if got, ok := store.Get(clientAddr.String()); !ok || got != active {
+						t.Fatalf("session closed before the final consecutive confirmation at call %d", call+1)
+					}
+				}
+				select {
+				case controller.release <- struct{}{}:
+				case <-time.After(time.Second):
+					t.Fatalf("status call %d did not accept its release", call+1)
+				}
+			}
+
+			deadline := time.Now().Add(time.Second)
+			for {
+				instance.mu.Lock()
+				ready := instance.backendReady
+				instance.mu.Unlock()
+				if !ready {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("gate remained open after three subsequent consecutive confirmed non-running states")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			select {
+			case <-active.Done():
+			case <-time.After(time.Second):
+				t.Fatal("confirmed backend loss did not close the established session")
+			}
+		})
+	}
 }
 
 func TestBackendHealthMonitorIgnoresFailedProbeFromOlderReadinessGeneration(t *testing.T) {

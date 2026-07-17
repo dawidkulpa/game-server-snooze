@@ -85,6 +85,11 @@ func backendHealthFailureClass(err error) string {
 	return "probe_failure"
 }
 
+func backendReadinessInconclusive(err error) bool {
+	var target interface{ ReadinessInconclusive() bool }
+	return errors.As(err, &target) && target.ReadinessInconclusive()
+}
+
 type packetQueue struct {
 	packets        [][]byte
 	bytes          int
@@ -274,7 +279,10 @@ func (proxy *Proxy) handleClientPacket(clientAddr *net.UDPAddr, packet []byte) {
 		return
 	}
 	if created {
-		logrus.WithField("active_sessions", activeCount).Info("UDP session opened")
+		logrus.WithFields(logrus.Fields{
+			"active_sessions": activeCount,
+			"client_ip":       clientAddr.IP.String(),
+		}).Info("UDP session opened")
 		proxy.cancelAutoStop()
 		proxy.watchSession(key, createdSession)
 	}
@@ -602,6 +610,14 @@ func (proxy *Proxy) runBackendHealthMonitor() {
 			continue
 		}
 		failureClass := backendHealthFailureClass(err)
+		if backendReadinessInconclusive(err) {
+			failures.reset()
+			logrus.WithFields(logrus.Fields{
+				"active_sessions": proxy.store.Len(),
+				"failure_class":   failureClass,
+			}).Warn("Pterodactyl backend health probe inconclusive; keeping UDP forwarding enabled")
+			continue
+		}
 		failureCount := failures.record(generation)
 		if failureCount < backendHealthFailureThreshold {
 			logrus.WithFields(logrus.Fields{
