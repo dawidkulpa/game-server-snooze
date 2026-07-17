@@ -254,6 +254,8 @@ docker-compose.yml
 - Candidate image digest recorded.
 - Session-open logs prove IPv4/IPv6 `client_ip` attribution without source ports.
 - Repeated inconclusive Pterodactyl failures keep established forwarding and sessions open; repeated confirmed non-running states still close them.
+- Deterministic real-`PterodactylProbe` sequences prove that both `running` and inconclusive results reset two prior non-running confirmations, and that only three subsequent consecutive recognized non-running responses close the gate and sessions.
+- The immutable candidate patch preserves its terminal newline and passes `git apply --numstat` from the recorded base before review dispatch.
 
 ### Live-validation gate
 

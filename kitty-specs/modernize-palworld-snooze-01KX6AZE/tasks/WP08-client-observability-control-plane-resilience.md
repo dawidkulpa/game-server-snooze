@@ -54,9 +54,10 @@ Use strict vertical TDD. First prove that accepted IPv4 and IPv6 session-open lo
 
 - **T028:** Record the incident timeline and update the spec/plan before application code.
 - **T029:** Add and run RED IPv4/IPv6 structured logging tests; implement normalized `client_ip` on every successful session creation.
-- **T030:** Add and run RED Pterodactyl timeout and confirmed-state sequence tests; implement inconclusive-error classification and confirmation-only gating.
-- **T031:** Update public operational documentation, run focused/full/race/vet/format/build gates, create an immutable diff snapshot, obtain independent review, open the PR, and verify CI.
+- **T030:** Add and run Pterodactyl timeout and deterministic real-probe sequence tests. For both `running` and inconclusive reset cases, prove two confirmed non-running responses before the reset plus two after it remain open, and only the third subsequent confirmed response closes the gate and sessions. Implement inconclusive-error classification and confirmation-only gating.
+- **T031:** Update public operational documentation, run focused/full/race/vet/format/build gates, create an immutable diff snapshot whose terminal newline is preserved and whose patch passes `git apply --numstat` from the recorded base, obtain independent review, open the PR, and verify CI.
 
 ## Activity Log
 
 - 2026-07-17T10:34:21Z – hermes – Planned from the correlated production incident evidence; application implementation not started.
+- 2026-07-17T11:07:35Z – reviewer-renata – Requested deterministic real-probe reset-sequence coverage and a reproducibly applicable immutable patch artifact.

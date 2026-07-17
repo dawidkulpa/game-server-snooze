@@ -157,7 +157,7 @@ Given six active UDP sessions and a backend previously confirmed `running`, when
 
 ### AS-011: Confirmed backend stop during active forwarding
 
-Given active forwarding, when Pterodactyl successfully reports a recognized non-running state three consecutive times in the same readiness generation, the proxy closes the forwarding gate and all affected sessions. A `running` response or an inconclusive control-plane result between confirmations prevents the sequence from completing.
+Given active forwarding, when Pterodactyl successfully reports a recognized non-running state three consecutive times in the same readiness generation, the proxy closes the forwarding gate and all affected sessions. A `running` response or an inconclusive control-plane result between confirmations prevents the sequence from completing. Deterministic tests MUST prove both reset sequences through a real Pterodactyl readiness probe: two recognized non-running responses, then the reset result, then two more recognized non-running responses remain open; only a third subsequent recognized non-running response closes the gate and sessions.
 
 ### AS-012: Connection attribution
 
