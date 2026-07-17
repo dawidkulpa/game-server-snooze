@@ -21,10 +21,10 @@ type inconclusiveReadinessError struct {
 	err error
 }
 
-func (err inconclusiveReadinessError) Error() string { return err.err.Error() }
-func (err inconclusiveReadinessError) Unwrap() error { return err.err }
+func (err inconclusiveReadinessError) Error() string           { return err.err.Error() }
+func (err inconclusiveReadinessError) Unwrap() error           { return err.err }
 func (inconclusiveReadinessError) ReadinessInconclusive() bool { return true }
-func (err inconclusiveReadinessError) Permanent() bool { return server.IsPermanent(err.err) }
+func (err inconclusiveReadinessError) Permanent() bool         { return server.IsPermanent(err.err) }
 
 func NewPterodactylProbe(controller server.Controller, pollInterval time.Duration) (*PterodactylProbe, error) {
 	if controller == nil || pollInterval <= 0 {
