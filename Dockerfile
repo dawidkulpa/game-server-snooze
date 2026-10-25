@@ -7,7 +7,7 @@ ARG VERSION=dev
 ARG VCS_REF=unknown
 ENV CGO_ENABLED=0
 WORKDIR /src
-RUN apk add --no-cache ca-certificates=20260611-r0
+RUN apk add --no-cache ca-certificates=20261020-r0
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
