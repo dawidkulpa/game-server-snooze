@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1.18@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf
 
-FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.23@sha256:754d5200fc3edae76d3b6598a9a3fac7e74981ee6a5413ab955025f185753ef2 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
 ARG VCS_REF=unknown
 ENV CGO_ENABLED=0
 WORKDIR /src
-RUN apk add --no-cache ca-certificates=20260611-r0
+RUN apk add --no-cache ca-certificates=20261020-r0
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
